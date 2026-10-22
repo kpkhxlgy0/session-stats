@@ -6,6 +6,7 @@ const { createRemoteSessionStore } = require('../src/remote-session-store.cjs');
 
 const ThreadId = '11111111-1111-4111-8111-111111111111';
 const OtherThreadId = '22222222-2222-4222-8222-222222222222';
+const RolloutSuffixId = '01a16451-110e-76a0-b4a3-1d36713c77de';
 const HostId = 'remote-control:host-one';
 const OtherHostId = 'remote-control:host-two';
 
@@ -316,11 +317,37 @@ test('treats remote host IDs as opaque strings and normalizes valid UUID case', 
     assert.equal(stats.threadId, ThreadId);
 });
 
+test('reads rollout paths with a UUID suffix on Windows and Unix', async t =>
+{
+    for (const path of [
+        `C:\\Users\\user\\.codex\\sessions\\2026\\10\\22\\rollout-2026-10-22T23-53-16-${ThreadId}_${RolloutSuffixId}.jsonl`,
+        `/home/user/.codex/sessions/2026/10/22/rollout-2026-10-22T23-53-16-${ThreadId}_${RolloutSuffixId}.jsonl`,
+    ])
+    {
+        const { store, identity } = fixture(t);
+        const source = remote(lines({ type: 'session_meta', payload: { id: ThreadId } }, usage('response-one', 1200)));
+        source.path = path;
+        const stats = await store.getStats(identity, source.request);
+        assert.equal(stats.status, 'ok');
+        assert.equal(stats.totalTokens, 1200);
+        assert.equal(stats.steps, 1);
+    }
+});
+
 test('rejects mismatched thread IDs and unrelated or null-containing rollout paths', async t =>
 {
     for (const change of [
         state => { state.threadId = OtherThreadId; },
+        state => { state.threadId = OtherThreadId; state.path = `/private/rollout-date-${ThreadId}_${RolloutSuffixId}.jsonl`; },
         state => { state.path = `/private/rollout-date-${OtherThreadId}.jsonl`; },
+        state => { state.path = `/private/rollout-date-${OtherThreadId}_${RolloutSuffixId}.jsonl`; },
+        state => { state.path = `/private/rollout-date-${OtherThreadId}_${ThreadId}.jsonl`; },
+        state => { state.path = `/private/rollout-date-${ThreadId}_private.jsonl`; },
+        state => { state.path = `/private/rollout-date-${ThreadId}_.jsonl`; },
+        state => { state.path = `/private/rollout-date-${ThreadId}_11111111-1111-0111-8111-111111111111.jsonl`; },
+        state => { state.path = `/private/rollout-date-${ThreadId}_11111111-1111-4111-7111-111111111111.jsonl`; },
+        state => { state.path = `/private/rollout-date-${ThreadId}_${RolloutSuffixId}_${RolloutSuffixId}.jsonl`; },
+        state => { state.path = `/private/rollout-date-${ThreadId}_${RolloutSuffixId}.other.jsonl`; },
         state => { state.path = `/private/not-rollout-${ThreadId}.jsonl`; },
         state => { state.path = `/private/rollout-date-${ThreadId}.jsonl/other`; },
         state => { state.path = `/private\u0000/rollout-date-${ThreadId}.jsonl`; },
@@ -337,11 +364,16 @@ test('rejects mismatched thread IDs and unrelated or null-containing rollout pat
 
 test('rejects a session_meta record whose ID belongs to another session', async t =>
 {
-    const { store, identity } = fixture(t);
-    const source = remote(lines(usage('private', 9900), { type: 'session_meta', payload: { id: OtherThreadId } }));
-    const stats = await store.getStats(identity, source.request);
-    assert.equal(stats.status, 'unavailable');
-    assert.equal(stats.totalTokens, null);
+    for (const suffix of ['', `_${RolloutSuffixId}`])
+    {
+        const { store, identity } = fixture(t);
+        const source = remote(lines(usage('private', 9900), { type: 'session_meta', payload: { id: OtherThreadId } }));
+        source.path = `/private/rollout-date-${ThreadId}${suffix}.jsonl`;
+        const stats = await store.getStats(identity, source.request);
+        assert.equal(stats.status, 'unavailable');
+        assert.equal(stats.totalTokens, null);
+        assert.equal(source.calls.some(call => call.method === 'fs/readFile'), true);
+    }
 });
 
 test('rejects directories, symlinks and incomplete metadata', async t =>

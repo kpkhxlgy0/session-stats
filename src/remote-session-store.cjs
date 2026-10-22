@@ -43,7 +43,8 @@ function validPath(value, threadId)
 {
     if (typeof value !== 'string' || value.includes('\0')) return false;
     const name = value.split(/[\\/]/).pop();
-    return new RegExp(`^rollout-.+-${threadId}\\.jsonl$`, 'i').test(name);
+    const match = new RegExp(`^rollout-.+-${threadId}(?:_(.+))?\\.jsonl$`, 'i').exec(name);
+    return match !== null && (match[1] === undefined || validThreadId(match[1]) !== null);
 }
 
 function metadataKey(metadata, path)

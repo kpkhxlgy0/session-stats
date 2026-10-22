@@ -41,7 +41,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.1.4](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.4)。
+版本：[v0.1.5](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.5)。
 
 ## 本地 Inject / Uninject
 
@@ -84,7 +84,7 @@ npm run install:local
 
 - 本地会话增量读取 `$CODEX_HOME/sessions` 和 `archived_sessions`；未设置时使用 `~/.codex`。
 - 远程会话通过 Codex 已有的主机连接读取 `thread/read` 返回的日志路径，不会查找本机同名会话。
-  路径文件名、返回的会话 ID 和日志内的会话元数据都必须匹配。
+  兼容会话 ID 后带单个 `_UUID` 后缀的日志文件名；路径文件名、返回的会话 ID 和日志内的会话元数据都必须匹配。
 - 日志保持只读，不修改远程文件、不运行远程命令，也不向第三方上传数据。
   远程日志通过应用的主页面桥接传给本地统计器；不落盘、不写入运行日志。底栏只接收指标和会话标识。
 - 支持完整行追加、拆分 UTF-8、文件截断或替换、同一会话并发读取去重，以及负查询缓存。
@@ -99,7 +99,7 @@ npm run install:local
   或身份校验失败时显示 `—`，恢复后自动重试。远程统计会有相应刷新延迟。
 - DOM 变化合并处理；运行日志仅记录启动和首次成功挂载的指标摘要。
 - 远程桥接依赖 Codex 内部协议，已按 Windows 安装包 `26.1016.51333` 核对并做协议回归测试；
-  尚未完成真实远程会话的端到端界面验证。
+  已在 Windows 真实 Remote Control 会话确认统计恢复，其他平台的原生界面尚未实测。
 
 ## 文件
 
