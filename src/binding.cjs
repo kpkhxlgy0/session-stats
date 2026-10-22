@@ -1,6 +1,6 @@
 "use strict";
 
-// 固定脚本仅返回会话 ID，不跨隔离环境传递 React 对象或聊天内容。
+// 固定脚本仅返回会话与主机 ID，不跨隔离环境传递 React 对象或聊天内容。
 function createBindings() {
     const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     function currentFiber(fiber) {
@@ -14,15 +14,32 @@ function createBindings() {
         if (!value || typeof value !== "object") return null;
         const threadId = value.conversationId ?? value.threadId;
         if (typeof threadId !== "string" || !UUID.test(threadId)) return null;
-        return { threadId: threadId.toLowerCase(), hostId: value.hostId ?? "local" };
+        return { threadId: threadId.toLowerCase(), hostId: value.hostId };
     }
 
     function routeIdentity(location) {
         if (!location || typeof location.pathname !== "string") return null;
         const match = /^\/(?:local|hotkey-window\/thread)\/([0-9a-f-]+)\/?$/i.exec(location.pathname);
         if (!match || !UUID.test(match[1])) return null;
-        const hostId = new URLSearchParams(location.search ?? "").get("hostId") ?? "local";
+        const hostId = new URLSearchParams(location.search ?? "").get("hostId") ?? undefined;
         return { threadId: match[1].toLowerCase(), hostId };
+    }
+
+    function bind(candidate, hosts, routes) {
+        const explicit = [...hosts, candidate.hostId,
+            ...routes.filter((route) => route?.threadId === candidate.threadId).map((route) => route.hostId)]
+            .filter((host) => host !== undefined);
+        if (explicit.some((host) => typeof host !== "string" || !host.length || host.length > 512
+            || /[\u0000-\u001f\u007f-\u009f]/.test(host)) || new Set(explicit).size > 1) return null;
+        return { threadId: candidate.threadId, hostId: explicit[0] ?? "local" };
+    }
+
+    function scopeHosts(props) {
+        return [props?.hostId, props?.threadKey?.hostId, props?.value?.hostId];
+    }
+
+    function scopeRoutes(props) {
+        return [routeIdentity(props?.location), routeIdentity(props?.value?.location)].filter(Boolean);
     }
 
     function resolveConversation(root, api, win) {
@@ -31,48 +48,55 @@ function createBindings() {
         let scopedBound = null;
         let direct = null;
         let route = null;
+        const hosts = [];
+        const routes = [];
         for (let node = fiber, depth = 0; node && depth < 80; node = node.return, depth++) {
             const props = node.memoizedProps;
             if (!props || typeof props !== "object") continue;
             const scoped = props.value;
-            if ([props.hostId, props.threadKey?.hostId, scoped?.hostId]
-                .some((host) => typeof host === "string" && host !== "local")) return null;
+            hosts.push(...scopeHosts(props));
             if (scoped?.kind === "new" || scoped?.kind === "cloud") return null;
             if (scoped?.kind === "local" || scoped?.kind === "codex") {
                 const bound = identity(scoped);
                 if (bound) scopedBound ??= bound;
             }
             direct ??= identity(props.threadKey) ?? identity(props);
-            const nodeRoute = routeIdentity(props.location) ?? routeIdentity(scoped?.location);
-            if (nodeRoute && nodeRoute.hostId !== "local") return null;
-            route ??= nodeRoute;
+            const nodeRoutes = scopeRoutes(props);
+            routes.push(...nodeRoutes);
+            route ??= nodeRoutes[0];
         }
         const windowRoute = routeIdentity(win.location);
-        if (windowRoute && windowRoute.hostId !== "local") return null;
-        if (scopedBound) return scopedBound;
-        if (direct) return direct.hostId === "local" ? direct : null;
-        if (route) return route.hostId === "local" ? route : null;
+        if (windowRoute) routes.push(windowRoute);
+        if (scopedBound) return bind(scopedBound, hosts, routes);
+        if (direct) return bind(direct, hosts, routes);
+        if (route) return bind(route, hosts, routes);
 
-        // 本地输入框内的 EnvironmentSetupProgressControl 通过 threadId 绑定会话。
+        // 输入框内的 EnvironmentSetupProgressControl 通过 threadId 绑定会话。
         const candidates = new Map();
-        const stack = fiber?.child ? [fiber.child] : [];
+        const stack = fiber?.child ? [{ node: fiber.child, hosts, routes }] : [];
         const visited = new Set();
         while (stack.length && visited.size < 1000) {
-            const node = stack.pop();
+            const scope = stack.pop();
+            const node = scope.node;
             if (!node || visited.has(node)) continue;
             visited.add(node);
-            const bound = identity(node.memoizedProps?.threadKey) ?? identity(node.memoizedProps);
-            if (bound) candidates.set(`${bound.hostId}:${bound.threadId}`, bound);
-            if (node.child) stack.push(node.child);
-            if (node.sibling) stack.push(node.sibling);
+            const props = node.memoizedProps;
+            const nodeHosts = [...scope.hosts, ...scopeHosts(props)];
+            const nodeRoutes = [...scope.routes, ...scopeRoutes(props)];
+            const candidate = identity(props?.threadKey) ?? identity(props);
+            if (candidate) {
+                const bound = bind(candidate, nodeHosts, nodeRoutes);
+                if (!bound) return null;
+                candidates.set(JSON.stringify([bound.hostId, bound.threadId]), bound);
+            }
+            if (node.child) stack.push({ node: node.child, hosts: nodeHosts, routes: nodeRoutes });
+            if (node.sibling) stack.push({ ...scope, node: node.sibling });
         }
         if (candidates.size > 1) return null;
-        if (candidates.size === 1) {
-            const bound = [...candidates.values()][0];
-            return bound.hostId === "local" ? bound : null;
-        }
-        if (windowRoute) return windowRoute;
-        return identity({ conversationId: root.dataset.conversationId });
+        if (candidates.size === 1) return [...candidates.values()][0];
+        const domBound = identity({ conversationId: root.dataset.conversationId });
+        if (domBound) return bind(domBound, hosts, routes);
+        return windowRoute ? bind(windowRoute, hosts, routes) : null;
     }
 
     function readBindings() {

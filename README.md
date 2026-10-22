@@ -9,6 +9,10 @@ Codex++ tweak，在当前会话输入框底部显示：
 不显示上下文占用。统计行居中放在输入框下方已有的留白内，不占布局高度、不把输入框往上顶。
 适配浅色、深色主题，窄窗口可横向滚动；鼠标停在指标上可查看口径。
 
+支持本地及 Codex 已连接的远程主机会话，包括 Remote Control 主机。远程统计直接读取目标主机的
+会话日志，使用同一套指标口径；不需要在远端安装额外脚本。远端必须支持 Codex 的
+`thread/read`、`fs/getMetadata` 和 `fs/readFile` 接口，并能访问该会话的 rollout 日志。
+
 ## 指标口径
 
 | 指标 | 计算方式 |
@@ -37,7 +41,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.1.3](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.3)。
+版本：[v0.1.4](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.4)。
 
 ## 本地 Inject / Uninject
 
@@ -78,21 +82,32 @@ npm run install:local
 
 ## 数据与兼容性
 
-- 仅增量读取 `$CODEX_HOME/sessions` 和 `archived_sessions`；未设置时使用 `~/.codex`。
-- 本地 JSONL 保持只读；不修改日志、上传数据或发送聊天内容。跨进程只返回指标和会话标识。
+- 本地会话增量读取 `$CODEX_HOME/sessions` 和 `archived_sessions`；未设置时使用 `~/.codex`。
+- 远程会话通过 Codex 已有的主机连接读取 `thread/read` 返回的日志路径，不会查找本机同名会话。
+  路径文件名、返回的会话 ID 和日志内的会话元数据都必须匹配。
+- 日志保持只读，不修改远程文件、不运行远程命令，也不向第三方上传数据。
+  远程日志通过应用的主页面桥接传给本地统计器；不落盘、不写入运行日志。底栏只接收指标和会话标识。
 - 支持完整行追加、拆分 UTF-8、文件截断或替换、同一会话并发读取去重，以及负查询缓存。
-- 根据当前输入框的会话标识绑定，跳过首页、云端、远程主机和无法唯一识别的输入框。
+- 根据当前输入框的主机 ID 和会话 ID 共同绑定，跳过首页、云端任务和无法唯一识别的输入框。
 - Codex 开启 Electron 隔离环境时，主进程在调用方主页面执行固定的只读标识查询脚本，
   仅返回输入框标记、会话 ID 和主机 ID。脚本不接收外部代码，也不跨环境传递 React 对象或聊天内容。
 - 输入框及 React 属性属于 Codex 内部实现，未来应用更新可能需要调整 `src/binding.cjs`；
   无法绑定时隐藏统计条，不猜测当前会话。
-- 页面可见时约每秒刷新数据，DOM 变化合并处理；运行日志仅记录启动和首次成功挂载的指标摘要。
+- 页面可见时约每秒刷新底栏；本地日志增量读取，远程请求至少间隔 15 秒。
+  远程日志超过 4 MiB 时改为至少 60 秒；路径及文件时间未变时不重复下载。同一会话的并发请求合并。
+  当前远程接口只确认支持整文件读取，因此日志超过 32 MiB 时暂不提供统计；超时、断线、接口不支持
+  或身份校验失败时显示 `—`，恢复后自动重试。远程统计会有相应刷新延迟。
+- DOM 变化合并处理；运行日志仅记录启动和首次成功挂载的指标摘要。
+- 远程桥接依赖 Codex 内部协议，已按 Windows 安装包 `26.1016.51333` 核对并做协议回归测试；
+  尚未完成真实远程会话的端到端界面验证。
 
 ## 文件
 
 - `index.js`：主进程和渲染进程生命周期、IPC。
 - `src/metrics.cjs`：用量去重、缓存命中率、模型时间并集和 TPS。
 - `src/session-store.cjs`：会话文件发现、增量只读读取和缓存。
+- `src/remote-session-store.cjs`：远程会话日志校验、快照统计和轮询缓存。
+- `src/remote-transport.cjs`：现有主机连接的只读请求、分块响应和取消清理。
 - `src/binding.cjs`：当前输入框会话绑定。
 - `src/renderer.cjs`：统计条、会话切换和清理。
 - `test/`：指标、文件轮换、隔离环境、切换会话和热重载回归测试。

@@ -25,8 +25,8 @@ function fixture() {
     const requests = [];
     const api = {
         react: { getFiber: () => fiber },
-        ipc: { invoke: async (channel, id) => {
-            assert.equal(channel, "stats"); requests.push(id); return { ...stats, threadId: id };
+        ipc: { invoke: async (channel, bound) => {
+            assert.equal(channel, "stats"); requests.push(bound); return { ...stats, ...bound };
         } },
         log: { info() {}, warn() {} },
     };
@@ -37,11 +37,12 @@ async function settle(dom) {
     await new Promise((resolve) => dom.window.setTimeout(resolve, 120));
 }
 
-test("composer identity comes from its scoped React data and rejects remote hosts", () => {
+test("composer identity comes from its scoped React data and supports remote hosts", () => {
     const f = fixture();
     assert.deepEqual(resolveConversation(f.root, f.api, f.dom.window), { threadId: firstId, hostId: "local" });
     f.fiber.return.memoizedProps.value.hostId = "remote-control:example";
-    assert.equal(resolveConversation(f.root, f.api, f.dom.window), null);
+    assert.deepEqual(resolveConversation(f.root, f.api, f.dom.window),
+        { threadId: firstId, hostId: "remote-control:example" });
     f.dom.window.close();
 });
 
@@ -55,25 +56,27 @@ test("composer subtree thread identity is available when the app uses a memory r
     f.dom.window.close();
 });
 
-test("explicit remote host on an outer scope or route vetoes an implicit local identity", () => {
+test("explicit remote host on an outer scope or route supplies an implicit identity host", () => {
     const f = fixture();
     delete f.fiber.return.memoizedProps.value.hostId;
     f.fiber.return.return = { memoizedProps: { hostId: "remote-control:example" } };
-    assert.equal(resolveConversation(f.root, f.api, f.dom.window), null);
+    assert.deepEqual(resolveConversation(f.root, f.api, f.dom.window),
+        { threadId: firstId, hostId: "remote-control:example" });
     f.fiber.return = { memoizedProps: {
         threadId: firstId,
         location: { pathname: `/local/${firstId}`, search: "?hostId=remote-control%3Aexample" },
     } };
-    assert.equal(resolveConversation(f.root, f.api, f.dom.window), null);
+    assert.deepEqual(resolveConversation(f.root, f.api, f.dom.window),
+        { threadId: firstId, hostId: "remote-control:example" });
     f.dom.window.close();
 });
 
 test("isolated preload obtains only composer identities through the main-world bridge", async () => {
     const f = fixture();
     f.api.react.getFiber = () => null;
-    f.api.ipc.invoke = async (channel, id) => channel === "bindings"
+    f.api.ipc.invoke = async (channel, bound) => channel === "bindings"
         ? [{ key: f.root.dataset.sessionStatsKey, bound: { threadId: firstId, hostId: "local" } }]
-        : { ...stats, threadId: id };
+        : { ...stats, ...bound };
     const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
     await settle(f.dom);
     assert.match(f.root.querySelector("[data-session-stats]")?.textContent ?? "", /209 tok\/s/);
@@ -118,16 +121,16 @@ test("footer displays the five metrics without context occupancy and cleans up",
 test("a late previous-chat result cannot overwrite the newly selected conversation", async () => {
     const f = fixture();
     let resolveFirst;
-    f.api.ipc.invoke = async (_channel, id) => id === firstId
+    f.api.ipc.invoke = async (_channel, bound) => bound.threadId === firstId
         ? new Promise((resolve) => { resolveFirst = resolve; })
-        : { ...stats, threadId: id, turns: 7, tps: null };
+        : { ...stats, ...bound, turns: 7, tps: null };
     const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
     await settle(f.dom);
     assert.equal(typeof resolveFirst, "function");
     f.fiber.return.memoizedProps.value.conversationId = secondId;
     f.root.appendChild(f.dom.window.document.createElement("span"));
     await settle(f.dom);
-    resolveFirst({ ...stats, threadId: firstId });
+    resolveFirst({ ...stats, threadId: firstId, hostId: "local" });
     await settle(f.dom);
     assert.match(f.root.querySelector("[data-session-stats]").textContent, /7 turns.*— tok\/s/);
     controller.stop(); f.dom.window.close();
@@ -141,4 +144,65 @@ test("home and hidden composers do not inherit another chat's statistics", async
     assert.equal(f.root.querySelector("[data-session-stats]"), null);
     assert.equal(f.requests.length, 0);
     controller.stop(); f.dom.window.close();
+});
+
+test("statistics requests include the remote host", async (t) => {
+    const f = fixture();
+    t.after(() => f.dom.window.close());
+    f.fiber.return.memoizedProps.value.hostId = "remote-control:example";
+    const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
+    t.after(() => controller.stop());
+    await settle(f.dom);
+    assert.deepEqual(f.requests, [{ threadId: firstId, hostId: "remote-control:example" }]);
+    assert.match(f.root.querySelector("[data-session-stats]")?.textContent ?? "", /209 tok\/s/);
+});
+
+test("statistics responses must match both thread and host including local requests", async (t) => {
+    for (const response of [
+        { ...stats, threadId: firstId },
+        { ...stats, threadId: firstId, hostId: "remote-control:example" },
+        { ...stats, threadId: secondId, hostId: "local" },
+    ]) {
+        const f = fixture();
+        t.after(() => f.dom.window.close());
+        f.api.ipc.invoke = async () => response;
+        const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
+        t.after(() => controller.stop());
+        await settle(f.dom);
+        assert.match(f.root.querySelector("[data-session-stats]").textContent, /— turns.*— tok\/s/);
+    }
+});
+
+test("a late result from the previous host cannot overwrite the same thread on another host", async (t) => {
+    const f = fixture();
+    t.after(() => f.dom.window.close());
+    let resolveFirst;
+    f.api.ipc.invoke = async (_channel, bound) => bound.hostId === "local"
+        ? new Promise((resolve) => { resolveFirst = resolve; })
+        : { ...stats, ...bound, turns: 7, tps: null };
+    const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
+    t.after(() => controller.stop());
+    await settle(f.dom);
+    assert.equal(typeof resolveFirst, "function");
+    f.fiber.return.memoizedProps.value.hostId = "remote-control:example";
+    f.root.appendChild(f.dom.window.document.createElement("span"));
+    await settle(f.dom);
+    assert.match(f.root.querySelector("[data-session-stats]")?.textContent ?? "", /7 turns.*— tok\/s/);
+    resolveFirst({ ...stats, threadId: firstId, hostId: "local" });
+    await settle(f.dom);
+    assert.match(f.root.querySelector("[data-session-stats]").textContent, /7 turns.*— tok\/s/);
+});
+
+test("remote log pending text does not describe the source as local", async (t) => {
+    const f = fixture();
+    t.after(() => f.dom.window.close());
+    f.fiber.return.memoizedProps.value.hostId = "remote-control:example";
+    f.api.ipc.invoke = async (_channel, bound) => ({ status: "not-found", ...bound });
+    const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
+    t.after(() => controller.stop());
+    await settle(f.dom);
+    const bar = f.root.querySelector("[data-session-stats]");
+    assert.ok(bar);
+    assert.match(bar.title, /等待.*日志/);
+    assert.doesNotMatch(bar.title, /本地/);
 });

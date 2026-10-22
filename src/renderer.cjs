@@ -61,7 +61,7 @@ function render(entry, stats) {
     set("tps", `${Number.isFinite(s.tps) && s.tps > 0 ? `${s.tpsHeld ? "~" : ""}${Math.round(s.tps)}` : "—"} tok/s`);
     set("tokens", `${compact(s.totalTokens)} tok`);
     set("cache", `Cache hit ${Number.isFinite(s.cacheHit) ? `${Math.round(s.cacheHit * 100)}%` : "—"}`);
-    const pending = stats?.status === "not-found" ? "等待当前会话的本地用量日志" : "当前会话暂无可用统计";
+    const pending = stats?.status === "not-found" ? "等待当前会话的用量日志" : "当前会话暂无可用统计";
     entry.bar.title = usable ? "" : pending;
     entry.fields.tokens.title = usable ? `累计 ${s.totalTokens ?? "—"} tokens；输入 ${s.inputTokens ?? "—"}，`
         + `输出 ${s.outputTokens ?? "—"}。缓存输入已包含在输入中。` : pending;
@@ -103,15 +103,17 @@ function startRenderer(api, options = {}) {
         if (stopped || entry.inflight || !root.isConnected) return;
         const request = {};
         const threadId = entry.threadId;
+        const hostId = entry.hostId;
         entry.inflight = request;
         try {
-            const stats = await api.ipc.invoke("stats", threadId);
+            const stats = await api.ipc.invoke("stats", { threadId, hostId });
             if (stopped || entries.get(root) !== entry || entry.inflight !== request) return;
-            if (stats?.threadId !== threadId) return;
+            if (stats?.threadId !== threadId || stats?.hostId !== hostId) return;
             render(entry, stats);
             if (stats.status === "ok" && !entry.logged) {
                 entry.logged = true;
-                api.log.info(`footer ready: ${threadId}; turns=${stats.turns}, steps=${stats.steps}, tps=${stats.tps}`);
+                api.log.info(`footer ready: ${hostId}/${threadId}; turns=${stats.turns}, `
+                    + `steps=${stats.steps}, tps=${stats.tps}`);
             }
         } catch {
             if (!stopped && entries.get(root) === entry && entry.inflight === request) render(entry, null);
@@ -155,9 +157,9 @@ function startRenderer(api, options = {}) {
                 if (entry) { entry.anchor.remove(); entries.delete(root); }
                 continue;
             }
-            if (!entry || entry.threadId !== bound.threadId) {
+            if (!entry || entry.threadId !== bound.threadId || entry.hostId !== bound.hostId) {
                 entry?.anchor.remove();
-                entry = { ...makeBar(doc), threadId: bound.threadId, inflight: null, logged: false };
+                entry = { ...makeBar(doc), ...bound, inflight: null, logged: false };
                 entries.set(root, entry);
                 render(entry, null);
                 root.append(entry.anchor);
