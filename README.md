@@ -6,7 +6,8 @@ Codex++ tweak，在当前会话输入框底部显示：
 2 turns · 33 steps · 209 tok/s     11.7M tok · Cache hit 96%
 ```
 
-不显示上下文占用。适配浅色、深色主题，窄窗口自动换行；鼠标停在指标上可查看口径。
+不显示上下文占用。统计行放在输入框下方已有的留白内，不占布局高度、不把输入框往上顶。
+适配浅色、深色主题，窄窗口可横向滚动；鼠标停在指标上可查看口径。
 
 ## 指标口径
 
@@ -35,7 +36,24 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.1.0](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.0)。
+版本：[v0.1.1](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.1)。
+
+## 本地 Inject / Uninject
+
+已安装 Codex++ 时，可在源码目录用 PowerShell 7 执行：
+
+```powershell
+pwsh -File .\Inject-CodexPlusPlus.ps1
+pwsh -File .\Uninject-CodexPlusPlus.ps1
+```
+
+两者都支持 `-CheckOnly`，只查看将执行的操作。脚本使用 `CODEX_PLUSPLUS_HOME`，
+未设置时使用 `%APPDATA%\codex-plusplus`。
+
+Inject 创建指向本目录的开发链接并启用 Session Stats，重复执行安全。
+Uninject 禁用此 tweak，并移除指向本目录的开发链接，保留源码。
+如果已从 Store 安装，脚本仅启用或禁用该副本，不替换或删除它。
+脚本不会安装、升级或卸载 Codex++，也不影响其他 tweak。
 
 ## 开发与验证
 

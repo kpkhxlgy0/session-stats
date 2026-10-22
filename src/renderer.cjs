@@ -22,6 +22,8 @@ function isVisible(root, win) {
 }
 
 function makeBar(doc) {
+    const anchor = doc.createElement("div");
+    anchor.dataset.sessionStatsAnchor = "";
     const bar = doc.createElement("div");
     bar.dataset.sessionStats = "";
     bar.className = "text-secondary text-xs";
@@ -40,11 +42,12 @@ function makeBar(doc) {
         fields[name] = field;
     }
     bar.append(activity, usage);
+    anchor.append(bar);
     fields.turns.title = "当前会话的轮次，按 turn_id 去重";
     fields.steps.title = "当前会话的模型调用次数，按 response_id 去重；不等于工具调用次数";
     fields.tps.title = "本轮平均 TPS：输出 Token（含推理）÷ 模型活跃时间；重叠区间只算一次，排除工具等待。"
         + "按响应完成更新；~ 表示暂时保留上次有效速度。";
-    return { bar, fields };
+    return { anchor, bar, fields };
 }
 
 function render(entry, stats) {
@@ -78,15 +81,19 @@ function startRenderer(api, options = {}) {
     const style = doc.createElement("style");
     style.dataset.sessionStatsStyle = "";
     style.textContent = `
+        [data-session-stats-anchor] {
+            position: relative; height: 0; min-height: 0; margin: 0; padding: 0; border: 0;
+        }
         [data-session-stats] {
-            display: flex; flex-wrap: wrap; align-items: center;
-            gap: calc(var(--spacing, .25rem) * 1) calc(var(--spacing, .25rem) * 5);
-            padding: calc(var(--spacing, .25rem) * 1.5) var(--spacing, .25rem) 0;
+            position: absolute; top: 2px; left: var(--spacing, .25rem); right: var(--spacing, .25rem);
+            display: flex; flex-wrap: nowrap; align-items: center;
+            gap: calc(var(--spacing, .25rem) * 5); padding: 0;
+            overflow-x: auto; scrollbar-width: none;
             color: var(--color-text-secondary, var(--color-token-text-secondary, inherit));
-            font-size: var(--text-xs, .75rem); line-height: var(--text-xs--line-height, 1.5);
+            font-size: var(--text-xs, 11px); line-height: 14px;
             font-variant-numeric: tabular-nums; user-select: text;
         }
-        [data-session-stats] .session-stats-group { white-space: nowrap; }
+        [data-session-stats] .session-stats-group { white-space: nowrap; flex-shrink: 0; }
     `;
     doc.head.append(style);
 
@@ -134,7 +141,7 @@ function startRenderer(api, options = {}) {
         }
         for (const [root, entry] of entries) {
             if (!roots.has(root) || !isVisible(root, win)) {
-                entry.bar.remove(); entries.delete(root);
+                entry.anchor.remove(); entries.delete(root);
             }
         }
         for (const root of roots) {
@@ -143,18 +150,18 @@ function startRenderer(api, options = {}) {
                 : resolveConversation(root, api, win);
             let entry = entries.get(root);
             if (!bound) {
-                if (entry) { entry.bar.remove(); entries.delete(root); }
+                if (entry) { entry.anchor.remove(); entries.delete(root); }
                 continue;
             }
             if (!entry || entry.threadId !== bound.threadId) {
-                entry?.bar.remove();
+                entry?.anchor.remove();
                 entry = { ...makeBar(doc), threadId: bound.threadId, inflight: null, logged: false };
                 entries.set(root, entry);
                 render(entry, null);
-                root.append(entry.bar);
+                root.append(entry.anchor);
                 void refresh(root, entry);
-            } else if (!entry.bar.isConnected) {
-                root.append(entry.bar);
+            } else if (!entry.anchor.isConnected) {
+                root.append(entry.anchor);
             }
         }
     }
@@ -192,7 +199,7 @@ function startRenderer(api, options = {}) {
             win.removeEventListener("hashchange", schedule);
             win.removeEventListener("resize", schedule);
             doc.removeEventListener("visibilitychange", schedule);
-            for (const entry of entries.values()) entry.bar.remove();
+            for (const entry of entries.values()) entry.anchor.remove();
             for (const root of doc.querySelectorAll(ROOT)) delete root.dataset.sessionStatsKey;
             entries.clear(); style.remove();
         },

@@ -109,6 +109,7 @@ test("footer displays the five metrics without context occupancy and cleans up",
     assert.equal(f.root.querySelectorAll("[data-session-stats]").length, 1);
     controller.stop();
     assert.equal(f.dom.window.document.querySelector("[data-session-stats]"), null);
+    assert.equal(f.dom.window.document.querySelector("[data-session-stats-anchor]"), null);
     assert.equal(f.dom.window.document.querySelector("[data-session-stats-style]"), null);
     controller.stop();
     f.dom.window.close();
