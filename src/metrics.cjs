@@ -114,7 +114,7 @@ function createMetrics()
         turn.pendingActivity = true;
         if (isModel)
         {
-            if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end > start)
+            if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start)
             {
                 turn.intervals.push([start, end]);
             }

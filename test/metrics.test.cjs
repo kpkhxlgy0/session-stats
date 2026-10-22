@@ -215,6 +215,22 @@ test('one missing model interval prevents a partial denominator from inflating s
     assert.equal(metrics.snapshot().tps, null);
 });
 
+test('a zero-length model item does not invalidate other measured intervals in the turn', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(event('task_started', 'turn-1'));
+    metrics.ingest(item('turn-1', 'Reasoning', 'reason-1', 0, 2000));
+    metrics.ingest(item('turn-1', 'AgentMessage', 'message-1', 2000, 2000));
+    metrics.ingest(usage('turn-1', 'response-1', 400));
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().modelActiveMs, 2000);
+    metrics.ingest(item('turn-1', 'Reasoning', 'reason-2', 3000, 4000));
+    metrics.ingest(usage('turn-1', 'response-2', 200));
+    metrics.ingest(event('task_complete', 'turn-1'));
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().modelActiveMs, 3000);
+});
+
 test('long model intervals remain measurable without an arbitrary reasoning time cap', () =>
 {
     const metrics = createMetrics();

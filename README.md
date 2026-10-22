@@ -23,6 +23,7 @@ Codex++ tweak，在当前会话输入框底部显示：
 `started_at_ms` / `completed_at_ms` 区间并集，重叠时间只算一次，排除工具执行、I/O 和用户等待。
 TPS 在响应完成后更新，`~` 表示新用量尚未到达时保留上次有效值。进入新轮清空旧轮速度。
 缺少完整用量、模型计时、轮次起点或有效时长时显示 `—`，不会通过字符数估算 Token。
+开始与结束时间相同的记录贡献 0 毫秒，不会让同轮其他有效计时失效；全轮不足 100 毫秒仍显示 `—`。
 
 这是依据客户端日志计算的本轮平均模型速度，包含模型处理阶段的开销，不是服务端测得的纯解码速度。
 旧日志可能只有累计 Token，而没有 steps 或 TPS 所需字段；截断、压缩或分叉后的历史也以现有日志为准。
@@ -36,7 +37,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.1.2](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.2)。
+版本：[v0.1.3](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.3)。
 
 ## 本地 Inject / Uninject
 
