@@ -1,0 +1,22 @@
+{
+  "name": "codex-session-stats",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kpkhxlgy0/session-stats.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "validate": "node scripts/codexpp.cjs validate-tweak",
+    "install:local": "node scripts/codexpp.cjs dev"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  }
+}
