@@ -6,7 +6,7 @@ Codex++ tweak，在当前会话输入框底部显示：
 2 turns · 33 steps · 209 tok/s     11.7M tok · Cache hit 96%
 ```
 
-不显示上下文占用。统计行放在输入框下方已有的留白内，不占布局高度、不把输入框往上顶。
+不显示上下文占用。统计行居中放在输入框下方已有的留白内，不占布局高度、不把输入框往上顶。
 适配浅色、深色主题，窄窗口可横向滚动；鼠标停在指标上可查看口径。
 
 ## 指标口径
@@ -36,7 +36,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.1.1](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.1)。
+版本：[v0.1.2](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.2)。
 
 ## 本地 Inject / Uninject
 

@@ -94,6 +94,8 @@ function startRenderer(api, options = {}) {
             font-variant-numeric: tabular-nums; user-select: text;
         }
         [data-session-stats] .session-stats-group { white-space: nowrap; flex-shrink: 0; }
+        [data-session-stats] .session-stats-group:first-child { margin-left: auto; }
+        [data-session-stats] .session-stats-group:last-child { margin-right: auto; }
     `;
     doc.head.append(style);
 
