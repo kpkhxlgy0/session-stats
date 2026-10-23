@@ -4,8 +4,9 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 
 const UuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const SessionPattern = /^rollout-.+-([0-9a-f-]{36})\.jsonl$/i;
+const SessionPattern = /^rollout-(.+?)-([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl$/i;
 const MaxSessions = 32;
+const MaxSources = 32;
 const MaxIndexEntries = 8192;
 const MaxDirectories = 2048;
 const MaxFilenames = 50000;
@@ -59,12 +60,10 @@ function createSessionStore({ codexHome, createMetrics } = {})
     function reset(entry)
     {
         entry.metrics = makeMetrics();
-        entry.offset = 0;
-        entry.pending = Buffer.alloc(0);
-        entry.skippingLine = false;
-        entry.identity = null;
-        entry.head = Buffer.alloc(0);
-        entry.tail = Buffer.alloc(0);
+        entry.sources = (entry.plan || []).map(source => ({ ...source,
+            offset: 0, pending: Buffer.alloc(0), skippingLine: false, lines: 0,
+            identity: null, head: Buffer.alloc(0), tail: Buffer.alloc(0),
+        }));
     }
 
     async function* entries(directory)
@@ -84,7 +83,8 @@ function createSessionStore({ codexHome, createMetrics } = {})
     function sessionId(name)
     {
         const match = SessionPattern.exec(name);
-        return match && UuidPattern.test(match[1]) ? match[1].toLowerCase() : null;
+        return match && UuidPattern.test(match[2]) && (!match[3] || UuidPattern.test(match[3]))
+            ? match[2].toLowerCase() : null;
     }
 
     async function refreshIndex()
@@ -98,6 +98,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
             const directories = roots.map(directory => ({ directory, depth: 0 })).reverse();
             let directoryCount = 0;
             let filenameCount = 0;
+            let indexedCount = 0;
             while (directories.length && directoryCount < MaxDirectories && filenameCount < MaxFilenames && !disposed)
             {
                 const { directory, depth } = directories.pop();
@@ -114,9 +115,11 @@ function createSessionStore({ codexHome, createMetrics } = {})
                     else if (child.isFile())
                     {
                         const id = sessionId(child.name);
-                        if (id && !found.has(id) && found.size < MaxIndexEntries)
+                        if (id && indexedCount < MaxIndexEntries)
                         {
-                            found.set(id, path.join(directory, child.name));
+                            if (!found.has(id)) found.set(id, []);
+                            found.get(id).push(path.join(directory, child.name));
+                            indexedCount++;
                         }
                     }
                     if (filenameCount >= MaxFilenames || disposed) break;
@@ -142,6 +145,8 @@ function createSessionStore({ codexHome, createMetrics } = {})
 
     async function locate(threadId)
     {
+        await refreshIndex();
+        const found = new Set(index.get(threadId) || []);
         const directories = [...roots];
         if (threadId[14] === '7')
         {
@@ -162,16 +167,127 @@ function createSessionStore({ codexHome, createMetrics } = {})
             {
                 if (child.isFile() && sessionId(child.name) === threadId)
                 {
-                    return path.join(directory, child.name);
+                    found.add(path.join(directory, child.name));
                 }
                 if (++count >= MaxFilenames || disposed) break;
             }
         }
-        await refreshIndex();
-        return index.get(threadId) || null;
+        // 同名归档副本只读一份，优先仍在 sessions 中的副本。
+        const unique = new Map();
+        const isArchived = filename => !filename.startsWith(roots[0] + path.sep);
+        for (const filename of [...found].sort((a, b) => Number(isArchived(a)) - Number(isArchived(b))))
+        {
+            try
+            {
+                if ((await fs.stat(filename)).isFile() && !unique.has(path.basename(filename)))
+                {
+                    unique.set(path.basename(filename), filename);
+                }
+            }
+            catch (error)
+            {
+                if (error.code !== 'ENOENT') throw error;
+            }
+        }
+        if (unique.size > MaxSources) throw new Error('Too many rollout sources');
+        return [...unique.values()].sort((a, b) =>
+        {
+            const left = SessionPattern.exec(path.basename(a));
+            const right = SessionPattern.exec(path.basename(b));
+            return left[1].localeCompare(right[1]) || (left[3] || '').localeCompare(right[3] || '');
+        });
     }
 
-    function consume(entry, chunk)
+    async function metadata(filename, threadId)
+    {
+        const handle = await fs.open(filename, 'r');
+        try
+        {
+            const chunks = [];
+            let offset = 0;
+            while (offset < MaxLineBytes)
+            {
+                const buffer = Buffer.alloc(Math.min(ChunkBytes, MaxLineBytes - offset));
+                const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+                if (!bytesRead) break;
+                const newline = buffer.subarray(0, bytesRead).indexOf(10);
+                chunks.push(buffer.subarray(0, newline === -1 ? bytesRead : newline));
+                offset += bytesRead;
+                if (newline === -1) continue;
+                let record;
+                try { record = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+                catch { break; }
+                if (record?.type !== 'session_meta') break;
+                const meta = record.payload;
+                if (typeof meta?.id !== 'string' || meta.id.toLowerCase() !== threadId
+                    || meta.session_id !== undefined && meta.session_id?.toLowerCase?.() !== threadId)
+                {
+                    throw new Error('Mismatched rollout identity');
+                }
+                return meta;
+            }
+            if (SessionPattern.exec(path.basename(filename))[3]) throw new Error('Missing continuation metadata');
+            return {};
+        }
+        finally { await handle.close(); }
+    }
+
+    async function matchesBoundary(filename, boundary)
+    {
+        const handle = await fs.open(filename, 'r');
+        try
+        {
+            if ((await handle.stat()).size < boundary.end_byte_offset) return false;
+            const buffer = Buffer.alloc(ChunkBytes);
+            let offset = 0;
+            let lines = 0;
+            let lastByte;
+            let chunks = 0;
+            while (offset < boundary.end_byte_offset && !disposed)
+            {
+                const size = Math.min(buffer.length, boundary.end_byte_offset - offset);
+                const { bytesRead } = await handle.read(buffer, 0, size, offset);
+                if (!bytesRead) return false;
+                for (let i = 0; i < bytesRead; i++) if (buffer[i] === 10) lines++;
+                offset += bytesRead;
+                lastByte = buffer[bytesRead - 1];
+                if (lines > boundary.end_ordinal_exclusive) return false;
+                if (++chunks % 8 === 0) await new Promise(setImmediate);
+            }
+            return offset === boundary.end_byte_offset && lastByte === 10
+                && lines === boundary.end_ordinal_exclusive;
+        }
+        finally { await handle.close(); }
+    }
+
+    async function makePlan(filenames, threadId)
+    {
+        async function resolve(filename, limit = null, ordinal = null)
+        {
+            const meta = await metadata(filename, threadId);
+            const source = { path: filename, limit, ordinal };
+            const boundary = meta.history_base;
+            if (boundary === undefined || boundary === null) return [source];
+            if (boundary.thread_id?.toLowerCase?.() !== threadId
+                || !Number.isSafeInteger(boundary.end_byte_offset) || boundary.end_byte_offset < 0
+                || !Number.isSafeInteger(boundary.end_ordinal_exclusive) || boundary.end_ordinal_exclusive < 0)
+            {
+                throw new Error('Invalid history boundary');
+            }
+            if (boundary.end_byte_offset === 0 && boundary.end_ordinal_exclusive === 0) return [source];
+            const matches = [];
+            // 只接受字节和记录边界均吻合的唯一历史源，不推测续接链。
+            for (const previous of filenames.slice(0, filenames.indexOf(filename)))
+            {
+                if (await matchesBoundary(previous, boundary)) matches.push(previous);
+            }
+            if (matches.length !== 1) throw new Error('Missing or ambiguous history source');
+            return [...await resolve(matches[0], boundary.end_byte_offset, boundary.end_ordinal_exclusive), source];
+        }
+        return filenames.length ? resolve(filenames[filenames.length - 1]) : [];
+    }
+
+    function consume(entry, chunk, metrics)
     {
         let start = 0;
         while (start < chunk.length)
@@ -202,10 +318,11 @@ function createSessionStore({ codexHome, createMetrics } = {})
                     {
                         record = undefined;
                     }
-                    if (record !== undefined) entry.metrics.ingest(record);
+                    if (record !== undefined) metrics.ingest(record);
                 }
             }
             if (newline === -1) break;
+            entry.lines++;
             entry.skippingLine = false;
             start = newline + 1;
         }
@@ -219,70 +336,105 @@ function createSessionStore({ codexHome, createMetrics } = {})
         return bytesRead === expected.length && actual.equals(expected);
     }
 
+    async function readSource(source, handle, size, metrics)
+    {
+        const buffer = Buffer.alloc(ChunkBytes);
+        let chunks = 0;
+        while (source.offset < size && !disposed)
+        {
+            const length = Math.min(buffer.length, size - source.offset);
+            const { bytesRead } = await handle.read(buffer, 0, length, source.offset);
+            if (!bytesRead) throw new Error('Rollout changed while reading');
+            const chunk = buffer.subarray(0, bytesRead);
+            if (source.head.length < GuardBytes)
+            {
+                source.head = Buffer.concat([source.head, chunk]).subarray(0, GuardBytes);
+            }
+            source.tail = Buffer.from(Buffer.concat([source.tail, chunk]).subarray(-GuardBytes));
+            source.offset += bytesRead;
+            consume(source, chunk, metrics);
+            if (++chunks % 8 === 0) await new Promise(setImmediate);
+        }
+        if (source.limit !== null && (source.lines !== source.ordinal || source.pending.length || source.skippingLine))
+        {
+            throw new Error('History boundary changed');
+        }
+    }
+
     async function read(entry)
     {
-        const handle = await fs.open(entry.path, 'r');
+        const files = [];
         try
         {
-            const stat = await handle.stat();
-            if (!stat.isFile()) throw new Error('Invalid session file');
-            const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
-            if (entry.identity !== null && (entry.identity !== identity || stat.size < entry.offset
-                || !await matchesGuard(handle, entry.head, 0)
-                || !await matchesGuard(handle, entry.tail, entry.offset - entry.tail.length)))
+            let changed = false;
+            for (const source of entry.sources)
             {
-                reset(entry);
-            }
-            entry.identity = identity;
-            const buffer = Buffer.alloc(ChunkBytes);
-            let chunks = 0;
-            while (entry.offset < stat.size && !disposed)
-            {
-                const size = Math.min(buffer.length, stat.size - entry.offset);
-                const { bytesRead } = await handle.read(buffer, 0, size, entry.offset);
-                if (!bytesRead) break;
-                const chunk = buffer.subarray(0, bytesRead);
-                if (entry.head.length < GuardBytes)
+                const handle = await fs.open(source.path, 'r');
+                files.push({ handle });
+                const stat = await handle.stat();
+                if (!stat.isFile() || source.limit !== null && stat.size < source.limit)
                 {
-                    entry.head = Buffer.concat([entry.head, chunk]).subarray(0, GuardBytes);
+                    throw new Error('Invalid session file');
                 }
-                entry.tail = Buffer.from(Buffer.concat([entry.tail, chunk]).subarray(-GuardBytes));
-                entry.offset += bytesRead;
-                consume(entry, chunk);
-                if (++chunks % 8 === 0) await new Promise(setImmediate);
+                const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+                const size = source.limit ?? stat.size;
+                Object.assign(files[files.length - 1], { size, identity });
+                if (source.identity !== null && (source.identity !== identity || size < source.offset
+                    || !await matchesGuard(handle, source.head, 0)
+                    || !await matchesGuard(handle, source.tail, source.offset - source.tail.length))) changed = true;
+            }
+            if (changed)
+            {
+                entry.lookupAt = -Infinity;
+                throw new Error('Rollout sources changed');
+            }
+            for (let i = 0; i < files.length; i++)
+            {
+                const { handle, size, identity } = files[i];
+                entry.sources[i].identity = identity;
+                await readSource(entry.sources[i], handle, size, entry.metrics);
             }
         }
         finally
         {
-            await handle.close();
+            await Promise.all(files.map(file => file.handle.close()));
         }
     }
 
     async function poll(entry)
     {
-        if (!entry.path)
+        const now = Date.now();
+        const retryMs = entry.plan?.length ? IndexRefreshMs : NegativeRetryMs;
+        if (now < entry.lookupAt || now - entry.lookupAt >= retryMs)
         {
-            const now = Date.now();
-            if (now >= entry.lookupAt && now - entry.lookupAt < NegativeRetryMs)
+            const filenames = await locate(entry.id);
+            const key = JSON.stringify(filenames);
+            if (key !== entry.filesKey || !entry.plan?.length || entry.lookupAt === -Infinity)
             {
-                return result(entry.id, 'not-found');
+                entry.plan = await makePlan(filenames, entry.id);
+                entry.filesKey = key;
+                reset(entry);
             }
-            entry.lookupAt = Date.now();
-            entry.path = await locate(entry.id);
-            if (!entry.path) return result(entry.id, 'not-found');
+            entry.lookupAt = now;
         }
+        if (!entry.plan?.length) return result(entry.id, 'not-found');
         try
         {
             await read(entry);
         }
         catch (error)
         {
-            if (error.code !== 'ENOENT') throw error;
+            const changed = entry.lookupAt === -Infinity;
             reset(entry);
+            if (!changed && error.code !== 'ENOENT') throw error;
             index.delete(entry.id);
-            entry.path = await locate(entry.id);
+            indexAt = -Infinity;
+            const filenames = await locate(entry.id);
+            entry.plan = await makePlan(filenames, entry.id);
+            entry.filesKey = JSON.stringify(filenames);
+            reset(entry);
             entry.lookupAt = Date.now();
-            if (!entry.path) return result(entry.id, 'not-found');
+            if (!entry.plan.length) return result(entry.id, 'not-found');
             await read(entry);
         }
         return result(entry.id, 'ok', entry);
@@ -304,14 +456,19 @@ function createSessionStore({ codexHome, createMetrics } = {})
                     if (!idle) return result(threadId, 'unavailable');
                     sessions.delete(idle[0]);
                 }
-                entry = { id: threadId, path: null, lookupAt: -Infinity };
+                entry = { id: threadId, lookupAt: -Infinity };
                 reset(entry);
             }
             sessions.delete(threadId);
             sessions.set(threadId, entry);
             if (entry.inFlight) return entry.inFlight;
             entry.inFlight = poll(entry).then(stats => disposed ? result(threadId, 'unavailable') : stats)
-                .catch(() => result(threadId, 'unavailable'))
+                .catch(() =>
+                {
+                    entry.lookupAt = -Infinity;
+                    reset(entry);
+                    return result(threadId, 'unavailable');
+                })
                 .finally(() => { entry.inFlight = null; });
             return entry.inFlight;
         }

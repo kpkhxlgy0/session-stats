@@ -17,7 +17,7 @@ Codex++ tweak，在当前会话输入框底部显示：
 
 | 指标 | 计算方式 |
 | --- | --- |
-| turns | 当前日志中不同 `turn_id` 的数量 |
+| turns | 当前有效日志历史中不同 `turn_id` 的数量 |
 | steps | 不同 `response_id` 的模型响应数量，不是工具调用次数 |
 | tok/s | 当前轮所有响应的官方 `usage.output_tokens`（包含推理）÷ 模型活跃秒数 |
 | tok | 官方会话累计 Token，输入 + 输出；缓存输入已经包含在输入里，不重复相加 |
@@ -41,7 +41,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.1.5](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.5)。
+版本：[v0.1.6](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.6)。
 
 ## 本地 Inject / Uninject
 
@@ -83,6 +83,10 @@ npm run install:local
 ## 数据与兼容性
 
 - 本地会话增量读取 `$CODEX_HOME/sessions` 和 `archived_sessions`；未设置时使用 `~/.codex`。
+  支持带 `_UUID` 后缀的续接日志，每 15 秒重新发现续接文件。按 `session_meta.history_base` 的
+  字节位置与记录数边界读取唯一匹配的旧日志前缀，再读取续接记录；被替换的旧尾部不参与统计。
+  响应按 `response_id` 去重，累计 Token 使用官方累计值，不对各日志的累计值求和。
+  归档同名副本不会重复读取；缺失历史、边界不完整或来源无法唯一确认时显示 `—`。
 - 远程会话通过 Codex 已有的主机连接读取 `thread/read` 返回的日志路径，不会查找本机同名会话。
   兼容会话 ID 后带单个 `_UUID` 后缀的日志文件名；路径文件名、返回的会话 ID 和日志内的会话元数据都必须匹配。
 - 日志保持只读，不修改远程文件、不运行远程命令，也不向第三方上传数据。
