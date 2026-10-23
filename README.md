@@ -20,7 +20,7 @@ Codex++ tweak，在当前会话输入框底部显示：
 | turns | 当前有效日志历史中不同 `turn_id` 的数量 |
 | steps | 不同 `response_id` 的模型响应数量，不是工具调用次数 |
 | tok/s | 当前轮所有响应的官方 `usage.output_tokens`（包含推理）÷ 模型活跃秒数 |
-| tok | 官方会话累计 Token，输入 + 输出；缓存输入已经包含在输入里，不重复相加 |
+| tok | 普通会话使用官方累计 Token；本地分叉会话仅累计分叉后每次响应的用量。输入 + 输出，缓存输入不重复相加 |
 | Cache hit | 累计缓存输入 Token ÷ 累计输入 Token |
 
 模型活跃时间取 `item_completed` 中 `Reasoning` 和 `AgentMessage` 的
@@ -30,7 +30,9 @@ TPS 在响应完成后更新，`~` 表示新用量尚未到达时保留上次有
 开始与结束时间相同的记录贡献 0 毫秒，不会让同轮其他有效计时失效；全轮不足 100 毫秒仍显示 `—`。
 
 这是依据客户端日志计算的本轮平均模型速度，包含模型处理阶段的开销，不是服务端测得的纯解码速度。
-旧日志可能只有累计 Token，而没有 steps 或 TPS 所需字段；截断、压缩或分叉后的历史也以现有日志为准。
+旧日志可能只有累计 Token，而没有 steps 或 TPS 所需字段；截断或压缩的历史也以可读日志为准。
+本地分页分叉会话只统计分叉后的轮次、steps、Token、缓存命中率和 TPS，不读取父会话历史。
+当前分支自身的续接日志仍会合并；缺少单次响应用量时，相应累计指标显示 `—`，不回退到包含父历史的累计值。
 
 TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/codex-statusbar)
 的 `TpsTracker.cs`，本项目独立实现。
@@ -41,7 +43,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.1.6](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.6)。
+版本：[v0.1.7](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.1.7)。
 
 ## 本地 Inject / Uninject
 
@@ -85,8 +87,9 @@ npm run install:local
 - 本地会话增量读取 `$CODEX_HOME/sessions` 和 `archived_sessions`；未设置时使用 `~/.codex`。
   支持带 `_UUID` 后缀的续接日志，每 15 秒重新发现续接文件。按 `session_meta.history_base` 的
   字节位置与记录数边界读取唯一匹配的旧日志前缀，再读取续接记录；被替换的旧尾部不参与统计。
-  响应按 `response_id` 去重，累计 Token 使用官方累计值，不对各日志的累计值求和。
-  归档同名副本不会重复读取；缺失历史、边界不完整或来源无法唯一确认时显示 `—`。
+  响应按 `response_id` 去重，普通会话使用官方累计值，不对各日志的累计值求和。
+  分叉会话在已确认的分叉边界停止回溯，并按唯一响应累计本分支用量；父历史缺失或压缩不影响统计。
+  归档同名副本不会重复读取；当前分支缺失历史、边界不完整或来源无法唯一确认时显示 `—`。
 - 远程会话通过 Codex 已有的主机连接读取 `thread/read` 返回的日志路径，不会查找本机同名会话。
   兼容会话 ID 后带单个 `_UUID` 后缀的日志文件名；路径文件名、返回的会话 ID 和日志内的会话元数据都必须匹配。
 - 日志保持只读，不修改远程文件、不运行远程命令，也不向第三方上传数据。

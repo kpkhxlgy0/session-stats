@@ -47,12 +47,13 @@ function measure(turn)
     return turn.outputTokens * 1000 / duration;
 }
 
-function createMetrics()
+function createMetrics({ responseTotals = false } = {})
 {
     const turns = new Map();
     const responses = new Set();
     let currentTurnId;
     let totals = { totalTokens: null, inputTokens: null, outputTokens: null, cachedInputTokens: null };
+    let missingResponseIdentity = false;
 
     function getTurn(turnId)
     {
@@ -80,8 +81,23 @@ function createMetrics()
     {
         if (responses.has(payload.response_id)) return;
         const turn = getTurn(payload.turn_id);
-        totals = readTotals(payload.thread_token_usage) || totals;
-        if (typeof payload.response_id !== 'string' || !payload.response_id)
+        const hasResponseId = typeof payload.response_id === 'string' && Boolean(payload.response_id);
+        if (responseTotals)
+        {
+            // 分叉会话仅累计当前分支的响应，不能沿用包含父历史的会话总量。
+            if (!hasResponseId) missingResponseIdentity = true;
+            const usage = readTotals(payload.usage);
+            for (const key of Object.keys(totals))
+            {
+                const value = usage?.[key] ?? null;
+                const previous = responses.size ? totals[key] : 0;
+                const sum = previous + value;
+                totals[key] = !missingResponseIdentity && previous !== null && value !== null
+                    && Number.isSafeInteger(sum) ? sum : null;
+            }
+        }
+        else totals = readTotals(payload.thread_token_usage) || totals;
+        if (!hasResponseId)
         {
             if (turn) turn.incompleteUsage = true;
             return;
@@ -147,7 +163,7 @@ function createMetrics()
                 }
             }
             else if (payload.type === 'item_completed') ingestItem(payload);
-            else if (payload.type === 'token_count')
+            else if (payload.type === 'token_count' && !responseTotals)
             {
                 totals = readTotals(payload.info?.total_token_usage) || totals;
             }

@@ -31,7 +31,7 @@ const EmptyStats = Object.freeze({
 
 function createSessionStore({ codexHome, createMetrics } = {})
 {
-    const makeMetrics = createMetrics || (() => require('./metrics.cjs').createMetrics());
+    const makeMetrics = createMetrics || (options => require('./metrics.cjs').createMetrics(options));
     const roots = typeof codexHome === 'string' && codexHome.length
         ? ['sessions', 'archived_sessions'].map(name => path.join(codexHome, name))
         : [];
@@ -59,7 +59,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
 
     function reset(entry)
     {
-        entry.metrics = makeMetrics();
+        entry.metrics = makeMetrics({ responseTotals: Boolean(entry.plan?.some(source => source.postFork)) });
         entry.sources = (entry.plan || []).map(source => ({ ...source,
             offset: 0, pending: Buffer.alloc(0), skippingLine: false, lines: 0,
             identity: null, head: Buffer.alloc(0), tail: Buffer.alloc(0),
@@ -224,15 +224,17 @@ function createSessionStore({ codexHome, createMetrics } = {})
                 {
                     throw new Error('Mismatched rollout identity');
                 }
-                return meta;
+                if (record.ordinal !== undefined && (!Number.isSafeInteger(record.ordinal) || record.ordinal < 0))
+                    throw new Error('Invalid rollout ordinal');
+                return { payload: meta, startOrdinal: record.ordinal ?? 0, hasOrdinal: record.ordinal !== undefined };
             }
             if (SessionPattern.exec(path.basename(filename))[3]) throw new Error('Missing continuation metadata');
-            return {};
+            return { payload: {}, startOrdinal: 0, hasOrdinal: false };
         }
         finally { await handle.close(); }
     }
 
-    async function matchesBoundary(filename, boundary)
+    async function matchesBoundary(filename, boundary, startOrdinal)
     {
         const handle = await fs.open(filename, 'r');
         try
@@ -251,11 +253,11 @@ function createSessionStore({ codexHome, createMetrics } = {})
                 for (let i = 0; i < bytesRead; i++) if (buffer[i] === 10) lines++;
                 offset += bytesRead;
                 lastByte = buffer[bytesRead - 1];
-                if (lines > boundary.end_ordinal_exclusive) return false;
+                if (lines > boundary.end_ordinal_exclusive - startOrdinal) return false;
                 if (++chunks % 8 === 0) await new Promise(setImmediate);
             }
             return offset === boundary.end_byte_offset && lastByte === 10
-                && lines === boundary.end_ordinal_exclusive;
+                && lines === boundary.end_ordinal_exclusive - startOrdinal;
         }
         finally { await handle.close(); }
     }
@@ -264,22 +266,34 @@ function createSessionStore({ codexHome, createMetrics } = {})
     {
         async function resolve(filename, limit = null, ordinal = null)
         {
-            const meta = await metadata(filename, threadId);
-            const source = { path: filename, limit, ordinal };
+            const head = await metadata(filename, threadId);
+            const meta = head.payload;
+            const source = { path: filename, limit, ordinal: ordinal === null ? null : ordinal - head.startOrdinal };
             const boundary = meta.history_base;
             if (boundary === undefined || boundary === null) return [source];
-            if (boundary.thread_id?.toLowerCase?.() !== threadId
+            if (!UuidPattern.test(boundary.thread_id ?? '')
                 || !Number.isSafeInteger(boundary.end_byte_offset) || boundary.end_byte_offset < 0
-                || !Number.isSafeInteger(boundary.end_ordinal_exclusive) || boundary.end_ordinal_exclusive < 0)
+                || !Number.isSafeInteger(boundary.end_ordinal_exclusive) || boundary.end_ordinal_exclusive < 0
+                || head.hasOrdinal && head.startOrdinal !== boundary.end_ordinal_exclusive)
             {
                 throw new Error('Invalid history boundary');
             }
+            if (UuidPattern.test(meta.forked_from_id ?? '') && meta.forked_from_id.toLowerCase() !== threadId
+                && meta.forked_from_ordinal_exclusive === boundary.end_ordinal_exclusive)
+            {
+                source.postFork = true;
+                return [source];
+            }
             if (boundary.end_byte_offset === 0 && boundary.end_ordinal_exclusive === 0) return [source];
             const matches = [];
-            // 只接受字节和记录边界均吻合的唯一历史源，不推测续接链。
+            // 只续接当前会话自己的分段；分叉起点之前的父历史不参与统计。
             for (const previous of filenames.slice(0, filenames.indexOf(filename)))
             {
-                if (await matchesBoundary(previous, boundary)) matches.push(previous);
+                const segmentId = SessionPattern.exec(path.basename(previous))[3];
+                if (boundary.thread_id.toLowerCase() !== threadId
+                    && segmentId?.toLowerCase() !== boundary.thread_id.toLowerCase()) continue;
+                const previousHead = await metadata(previous, threadId);
+                if (await matchesBoundary(previous, boundary, previousHead.startOrdinal)) matches.push(previous);
             }
             if (matches.length !== 1) throw new Error('Missing or ambiguous history source');
             return [...await resolve(matches[0], boundary.end_byte_offset, boundary.end_ordinal_exclusive), source];
