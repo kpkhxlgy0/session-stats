@@ -87,7 +87,7 @@ async function adapterFixture(t, { pathApi = path.posix, ...options } = {})
         },
         findSources: async threadId =>
         {
-            assert.equal(threadId, ThreadId);
+            assert.ok([ThreadId, OtherThreadId].includes(threadId));
             return candidates;
         },
         ...options,
@@ -187,7 +187,7 @@ test('source adapters fail closed when the requested history ordinal does not ma
     assert.equal(stats.totalTokens, 0);
 });
 
-test('source adapters stop at valid fork boundaries without reading parent history', async t =>
+test('source adapters preserve branch counts when the declared parent is missing', async t =>
 {
     const f = await adapterFixture(t);
     await f.write(`sessions/rollout-2026-10-22T10-00-00-${ThreadId}.jsonl`,
@@ -197,6 +197,47 @@ test('source adapters stop at valid fork boundaries without reading parent histo
     const stats = await f.store.getStats(ThreadId);
     assert.equal(stats.status, 'ok');
     assert.equal(stats.totalTokens, 30);
+    assert.equal(stats.tps, null);
+    assert.equal(stats.modelActiveMs, null);
+});
+
+for (const [platform, pathApi] of [['POSIX', path.posix], ['Windows', path.win32]])
+{
+    test(`source adapters resolve inherited ${platform} history with the existing filesystem interface`, async t =>
+    {
+        const f = await adapterFixture(t, { pathApi, createMetrics: () =>
+        {
+            const metrics = createMetrics();
+            return { ...metrics, snapshot()
+            {
+                const stats = metrics.snapshot();
+                return { ...stats, tps: stats.totalTokens, modelActiveMs: stats.totalTokens * 1000 };
+            } };
+        } });
+        const parent = jsonLine(0, { type: 'session_meta', payload: { id: OtherThreadId }, ordinal: 0 }) + jsonLine(10);
+        await f.write(`sessions/rollout-2026-10-22T10-00-00-${OtherThreadId}.jsonl`, parent + jsonLine(900));
+        await f.write(`sessions/rollout-2026-10-23T10-00-00-${ThreadId}.jsonl`,
+            sessionMeta({ forked_from_id: OtherThreadId, forked_from_ordinal_exclusive: 2,
+                history_base: { thread_id: OtherThreadId, end_byte_offset: Buffer.byteLength(parent),
+                    end_ordinal_exclusive: 2 } }, 2) + jsonLine(30));
+        const stats = await f.store.getStats(ThreadId);
+        assert.equal(stats.status, 'ok'); assert.equal(stats.totalTokens, 30);
+        assert.equal(stats.tps, 40); assert.equal(stats.modelActiveMs, 40000);
+    });
+}
+
+test('inherited adapter sources outside the session roots cannot supply TPS', async t =>
+{
+    const f = await adapterFixture(t);
+    const parent = jsonLine(0, { type: 'session_meta', payload: { id: OtherThreadId }, ordinal: 0 }) + jsonLine(10);
+    await f.write(`private/rollout-2026-10-22T10-00-00-${OtherThreadId}.jsonl`, parent);
+    await f.write(`sessions/rollout-2026-10-23T10-00-00-${ThreadId}.jsonl`,
+        sessionMeta({ forked_from_id: OtherThreadId, forked_from_ordinal_exclusive: 2,
+            history_base: { thread_id: OtherThreadId, end_byte_offset: Buffer.byteLength(parent),
+                end_ordinal_exclusive: 2 } }, 2) + jsonLine(30));
+    const stats = await f.store.getStats(ThreadId);
+    assert.equal(stats.status, 'ok'); assert.equal(stats.totalTokens, 30);
+    assert.equal(stats.tps, null); assert.equal(stats.modelActiveMs, null);
 });
 
 test('source adapters enforce the shared maximum source count', async t =>

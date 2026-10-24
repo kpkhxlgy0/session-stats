@@ -2,9 +2,10 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { createRolloutReader } = require('./rollout-reader.cjs');
 
 const UuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const SessionPattern = /^rollout-(.+?)-([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl$/i;
+const SessionPattern = /^rollout-(.+?)-([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl(?:\.zst)?$/i;
 const MaxSessions = 32;
 const MaxSources = 32;
 const MaxIndexEntries = 8192;
@@ -33,6 +34,7 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
     findSources, validateRecord } = {})
 {
     const makeMetrics = createMetrics || (options => require('./metrics.cjs').createMetrics(options));
+    const reader = createRolloutReader({ fileSystem });
     const roots = typeof codexHome === 'string' && codexHome.length
         ? ['sessions', 'archived_sessions'].map(name => pathApi.join(codexHome, name))
         : [];
@@ -55,16 +57,27 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
                 stats[key] = value;
             }
         }
+        if (entry?.plan?.some(source => source.postFork))
+        {
+            const inherited = entry.tpsMetrics?.snapshot();
+            stats.tps = inherited?.tps ?? null;
+            stats.modelActiveMs = inherited?.modelActiveMs ?? null;
+            stats.tpsHeld = Boolean(stats.tps !== null && stats.activeTurn
+                && (snapshot.tpsHeld || snapshot.tps === null));
+        }
         return { ...stats, status, threadId };
     }
 
     function reset(entry)
     {
         entry.metrics = makeMetrics({ responseTotals: Boolean(entry.plan?.some(source => source.postFork)) });
-        entry.sources = (entry.plan || []).map(source => ({ ...source,
+        entry.tpsMetrics = Array.isArray(entry.inheritedPlan) ? makeMetrics() : null;
+        const initialize = source => ({ ...source,
             offset: 0, pending: Buffer.alloc(0), skippingLine: false, lines: 0,
             identity: null, head: Buffer.alloc(0), tail: Buffer.alloc(0),
-        }));
+        });
+        entry.sources = (entry.plan || []).map(initialize);
+        entry.inheritedSources = (entry.inheritedPlan || []).map(initialize);
     }
 
     async function* entries(directory)
@@ -176,21 +189,30 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
         return found;
     }
 
-    async function locate(threadId)
+    async function locate(threadId, inherited = false)
     {
         const found = new Set(findSources ? await findSources(threadId) : await locateLocal(threadId));
         const candidates = [...found].filter(filename => typeof filename === 'string'
-            && sessionId(pathApi.basename(filename)) === threadId);
-        // 同名归档副本只读一份，优先仍在 sessions 中的副本。
+            && sessionId(pathApi.basename(filename)) === threadId
+            && (!inherited || roots.some(root =>
+            {
+                const relative = pathApi.relative(root, filename);
+                return relative && relative !== '..' && !relative.startsWith('..' + pathApi.sep)
+                    && !pathApi.isAbsolute(relative);
+            })));
+        // 同一逻辑分段只读一份，先选原始 JSONL，再选仍在 sessions 中的副本。
         const unique = new Map();
         const isArchived = filename => !filename.startsWith(roots[0] + pathApi.sep);
-        for (const filename of candidates.sort((a, b) => Number(isArchived(a)) - Number(isArchived(b))))
+        const isCompressed = filename => /\.zst$/i.test(filename);
+        for (const filename of candidates.sort((a, b) => Number(isCompressed(a)) - Number(isCompressed(b))
+            || Number(isArchived(a)) - Number(isArchived(b))))
         {
             try
             {
-                if ((await fileSystem.stat(filename)).isFile() && !unique.has(pathApi.basename(filename)))
+                const name = pathApi.basename(filename).replace(/\.zst$/i, '');
+                if ((await fileSystem.stat(filename)).isFile() && !unique.has(name))
                 {
-                    unique.set(pathApi.basename(filename), filename);
+                    unique.set(name, filename);
                 }
             }
             catch (error)
@@ -207,9 +229,9 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
         });
     }
 
-    async function metadata(filename, threadId)
+    async function metadata(filename, threadId, limit = MaxLineBytes)
     {
-        const handle = await fileSystem.open(filename, 'r');
+        const handle = await reader.open(filename, { limit });
         try
         {
             const chunks = [];
@@ -245,10 +267,11 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
 
     async function matchesBoundary(filename, boundary, startOrdinal)
     {
-        const handle = await fileSystem.open(filename, 'r');
+        const handle = await reader.open(filename, { limit: boundary.end_byte_offset });
         try
         {
             if ((await handle.stat()).size < boundary.end_byte_offset) return false;
+            if (boundary.end_byte_offset === 0) return boundary.end_ordinal_exclusive === startOrdinal;
             const buffer = Buffer.alloc(ChunkBytes);
             let offset = 0;
             let lines = 0;
@@ -291,11 +314,12 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
                 && meta.forked_from_ordinal_exclusive === boundary.end_ordinal_exclusive)
             {
                 source.postFork = true;
+                source.fork = { parentId: meta.forked_from_id.toLowerCase(), boundary };
                 return [source];
             }
             if (boundary.end_byte_offset === 0 && boundary.end_ordinal_exclusive === 0) return [source];
             const matches = [];
-            // 只续接当前会话自己的分段；分叉起点之前的父历史不参与统计。
+            // 分支计数只续接当前会话自己的分段；父历史单独进入 TPS 累计器。
             for (const previous of filenames.slice(0, filenames.indexOf(filename)))
             {
                 const segmentId = SessionPattern.exec(pathApi.basename(previous))[3];
@@ -310,7 +334,79 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
         return filenames.length ? resolve(filenames[filenames.length - 1]) : [];
     }
 
-    function consume(entry, chunk, metrics)
+    async function makeInheritedPlan(plan)
+    {
+        const fork = plan.find(source => source.postFork)?.fork;
+        if (!fork) return undefined;
+        const visited = new Set(plan.map(source => source.path));
+        const parents = new Map();
+
+        async function parentFiles(id)
+        {
+            if (!parents.has(id)) parents.set(id, await locate(id, true));
+            return parents.get(id);
+        }
+
+        async function resolveBoundary(id, boundary, filenames)
+        {
+            const matches = [];
+            for (const filename of filenames)
+            {
+                const segment = SessionPattern.exec(pathApi.basename(filename))[3];
+                if (boundary.thread_id.toLowerCase() !== id
+                    && segment?.toLowerCase() !== boundary.thread_id.toLowerCase()) continue;
+                const head = await metadata(filename, id,
+                    boundary.end_byte_offset ? Math.min(MaxLineBytes, boundary.end_byte_offset) : MaxLineBytes);
+                if (await matchesBoundary(filename, boundary, head.startOrdinal)) matches.push({ filename, head });
+            }
+            if (matches.length !== 1) throw new Error('Missing or ambiguous inherited source');
+            const { filename, head } = matches[0];
+            if (visited.has(filename) || visited.size >= MaxSources) throw new Error('Invalid inherited chain');
+            visited.add(filename);
+            const source = { path: filename, limit: boundary.end_byte_offset,
+                ordinal: boundary.end_ordinal_exclusive - head.startOrdinal };
+            const meta = head.payload;
+            const previous = meta.history_base;
+            if (previous === undefined || previous === null) return [source];
+            if (!UuidPattern.test(previous.thread_id ?? '')
+                || !Number.isSafeInteger(previous.end_byte_offset) || previous.end_byte_offset < 0
+                || !Number.isSafeInteger(previous.end_ordinal_exclusive) || previous.end_ordinal_exclusive < 0
+                || head.hasOrdinal && head.startOrdinal !== previous.end_ordinal_exclusive)
+            {
+                throw new Error('Invalid inherited boundary');
+            }
+            let history;
+            if (UuidPattern.test(meta.forked_from_id ?? '') && meta.forked_from_id.toLowerCase() !== id
+                && meta.forked_from_ordinal_exclusive === previous.end_ordinal_exclusive)
+            {
+                const parent = meta.forked_from_id.toLowerCase();
+                history = await resolveBoundary(parent, previous, await parentFiles(parent));
+            }
+            else if (previous.end_byte_offset === 0 && previous.end_ordinal_exclusive === 0) history = [];
+            else history = await resolveBoundary(id, previous, filenames.slice(0, filenames.indexOf(filename)));
+            return [...history, source];
+        }
+
+        return resolveBoundary(fork.parentId, fork.boundary, await parentFiles(fork.parentId));
+    }
+
+    async function refreshInherited(entry)
+    {
+        let inheritedPlan;
+        try
+        {
+            // 失败的父查询需要重建目录索引，但每个会话最多按重试间隔执行一次。
+            if (entry.inheritedPlan === null) indexAt = -Infinity;
+            inheritedPlan = await makeInheritedPlan(entry.plan);
+        }
+        catch { inheritedPlan = null; }
+        const changed = JSON.stringify(inheritedPlan) !== JSON.stringify(entry.inheritedPlan);
+        entry.inheritedPlan = inheritedPlan;
+        entry.inheritedAt = Date.now();
+        if (changed) reset(entry);
+    }
+
+    function consume(entry, chunk, metrics, strict = false)
     {
         let start = 0;
         while (start < chunk.length)
@@ -321,6 +417,7 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
             {
                 if (entry.pending.length + part.length > MaxLineBytes)
                 {
+                    if (strict) throw new Error('Inherited rollout record is too large');
                     entry.pending = Buffer.alloc(0);
                     entry.skippingLine = true;
                 }
@@ -339,6 +436,7 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
                     }
                     catch
                     {
+                        if (strict) throw new Error('Invalid inherited rollout record');
                         record = undefined;
                     }
                     if (record !== undefined)
@@ -363,7 +461,7 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
         return bytesRead === expected.length && actual.equals(expected);
     }
 
-    async function readSource(source, handle, size, metrics)
+    async function readSource(source, handle, size, metrics, strict = false)
     {
         const buffer = Buffer.alloc(ChunkBytes);
         let chunks = 0;
@@ -379,7 +477,7 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
             }
             source.tail = Buffer.from(Buffer.concat([source.tail, chunk]).subarray(-GuardBytes));
             source.offset += bytesRead;
-            consume(source, chunk, metrics);
+            consume(source, chunk, metrics, strict);
             if (++chunks % 8 === 0) await new Promise(setImmediate);
         }
         if (source.limit !== null && (source.lines !== source.ordinal || source.pending.length || source.skippingLine))
@@ -388,22 +486,43 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
         }
     }
 
-    async function read(entry)
+    function sourceIdentity(stat, inherited = false)
+    {
+        return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`
+            + (inherited ? `:${stat.mtimeMs}:${stat.ctimeMs}` : '');
+    }
+
+    async function verifyInherited(files)
+    {
+        try
+        {
+            for (const file of files)
+            {
+                const stats = await Promise.all([fileSystem.stat(file.path),
+                    ...(file.handle ? [file.handle.stat()] : [])]);
+                if (stats.some(stat => !stat.isFile() || sourceIdentity(stat, true) !== file.identity))
+                    throw new Error('Inherited rollout changed while reading');
+            }
+        }
+        catch (error) { throw Object.assign(error, { sourcesChanged: true }); }
+    }
+
+    async function readSources(sources, metrics, inherited = false)
     {
         const files = [];
         try
         {
             let changed = false;
-            for (const source of entry.sources)
+            for (const source of sources)
             {
-                const handle = await fileSystem.open(source.path, 'r');
-                files.push({ handle });
+                const handle = await reader.open(source.path, { limit: source.limit });
+                files.push({ handle, path: source.path });
                 const stat = await handle.stat();
                 if (!stat.isFile() || source.limit !== null && stat.size < source.limit)
                 {
                     throw new Error('Invalid session file');
                 }
-                const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+                const identity = sourceIdentity(stat, inherited);
                 const size = source.limit ?? stat.size;
                 Object.assign(files[files.length - 1], { size, identity });
                 if (source.identity !== null && (source.identity !== identity || size < source.offset
@@ -412,19 +531,77 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
             }
             if (changed)
             {
-                entry.lookupAt = -Infinity;
-                throw new Error('Rollout sources changed');
+                throw Object.assign(new Error('Rollout sources changed'), { sourcesChanged: true });
             }
             for (let i = 0; i < files.length; i++)
             {
                 const { handle, size, identity } = files[i];
-                entry.sources[i].identity = identity;
-                await readSource(entry.sources[i], handle, size, entry.metrics);
+                sources[i].identity = identity;
+                await readSource(sources[i], handle, size, metrics, inherited);
+            }
+            if (inherited)
+            {
+                await verifyInherited(files);
+                return files.map(({ path: filename, identity }) => ({ path: filename, identity }));
             }
         }
         finally
         {
             await Promise.all(files.map(file => file.handle.close()));
+        }
+    }
+
+    function discardInherited(entry)
+    {
+        // 父历史失效时丢弃整组 TPS 样本，分支可独立读取的计数仍然保留。
+        entry.inheritedPlan = null;
+        entry.inheritedAt = Date.now();
+        reset(entry);
+    }
+
+    async function readBranch(entry)
+    {
+        const metrics = { ingest(record)
+        {
+            entry.metrics.ingest(record);
+            entry.tpsMetrics?.ingest(record);
+        } };
+        try { await readSources(entry.sources, metrics); }
+        catch (error)
+        {
+            if (error.sourcesChanged) entry.lookupAt = -Infinity;
+            throw error;
+        }
+    }
+
+    async function read(entry, retry = true)
+    {
+        let inherited;
+        if (entry.tpsMetrics)
+        {
+            try { inherited = await readSources(entry.inheritedSources, entry.tpsMetrics, true); }
+            catch (error)
+            {
+                discardInherited(entry);
+                if (retry && error.sourcesChanged)
+                {
+                    await refreshInherited(entry);
+                    return read(entry, false);
+                }
+            }
+        }
+        await readBranch(entry);
+        if (!inherited) return;
+        try { await verifyInherited(inherited); }
+        catch (error)
+        {
+            discardInherited(entry);
+            if (retry && error.sourcesChanged)
+            {
+                await refreshInherited(entry);
+                return read(entry, false);
+            }
+            await readBranch(entry);
         }
     }
 
@@ -440,11 +617,19 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
             {
                 entry.plan = await makePlan(filenames, entry.id);
                 entry.filesKey = key;
+                entry.inheritedPlan = undefined;
+                entry.inheritedAt = -Infinity;
                 reset(entry);
             }
             entry.lookupAt = now;
         }
         if (!entry.plan?.length) return result(entry.id, 'not-found');
+        if (entry.plan.some(source => source.postFork)
+            && (now < entry.inheritedAt || now - entry.inheritedAt
+                >= (entry.inheritedPlan === null ? NegativeRetryMs : IndexRefreshMs)))
+        {
+            await refreshInherited(entry);
+        }
         try
         {
             await read(entry);
@@ -459,9 +644,11 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
             const filenames = await locate(entry.id);
             entry.plan = await makePlan(filenames, entry.id);
             entry.filesKey = JSON.stringify(filenames);
+            entry.inheritedPlan = undefined;
             reset(entry);
             entry.lookupAt = Date.now();
             if (!entry.plan.length) return result(entry.id, 'not-found');
+            await refreshInherited(entry);
             await read(entry);
         }
         return result(entry.id, 'ok', entry);
@@ -508,6 +695,7 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
     function dispose()
     {
         disposed = true;
+        reader.dispose();
         sessions.clear();
         index.clear();
     }

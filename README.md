@@ -19,7 +19,7 @@ Codex++ tweak，在当前会话输入框底部显示：
 | --- | --- |
 | turns | 当前有效日志历史中不同 `turn_id` 的数量 |
 | steps | 不同 `response_id` 的模型响应数量，不是工具调用次数 |
-| tok/s | 整个会话内有效轮次的官方 `usage.output_tokens`（包含推理）总和 ÷ 对应模型活跃秒数总和 |
+| tok/s | 包括 fork 继承历史在内的有效轮次官方 `usage.output_tokens`（包含推理）总和 ÷ 对应模型活跃秒数总和 |
 | tok | 普通会话使用官方累计 Token；本地分叉会话仅累计分叉后每次响应的用量。输入 + 输出，缓存输入不重复相加 |
 | Cache hit | 累计缓存输入 Token ÷ 累计输入 Token |
 
@@ -36,8 +36,11 @@ TPS 跨用户轮次累计，在响应完成后更新。进入新轮会保留已�
 先汇总输出与耗时再相除，不直接平均各轮 TPS；例如两轮各输出 1000 tokens、活跃时间分别为 5 秒与 20 秒，
 会话平均为 `2000 / 25 = 80 tok/s`。不同轮次分别计算区间并集，跨轮只汇总有效样本，不计用户等待。
 旧日志可能只有累计 Token，而没有 steps 或 TPS 所需字段；截断或压缩的历史也以可读日志为准。
-本地分页分叉会话只统计分叉后的轮次、steps、Token、缓存命中率和 TPS，不读取父会话历史。
-当前分支自身的续接日志仍会合并；缺少单次响应用量时，相应累计指标显示 `—`，不回退到包含父历史的累计值。
+分页分叉会话的 TPS 包含分叉点之前继承的有效历史，再与当前分支的新样本一起累计；
+父会话在分叉之后新增的内容不参与。多层 fork 和续接仍按各自的历史边界截断，重放响应只算一次。
+轮次、steps、Token 和缓存命中率继续只统计当前分支；TPS 的用量与耗时单独汇总。
+继承历史缺失、损坏或无法唯一确认时，TPS 显示 `—`，不会退回仅当前分支的部分平均值；
+能够独立确定的当前分支计数仍然显示。缺少单次响应用量时，相应累计指标显示 `—`，不回退到包含父历史的累计值。
 
 TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/codex-statusbar)
 的 `TpsTracker.cs`，本项目独立实现。
@@ -48,7 +51,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.3.1](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.3.1)。
+版本：[v0.4.0](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.4.0)。
 
 ## 本地 Inject / Uninject
 
@@ -84,14 +87,18 @@ npm run install:local
 链接到当前源码目录；运行时自动热重载。没有后台安装脚本、常驻开发进程或运行时 npm 依赖。
 可在 Codex++ Tweaks 管理界面禁用 Session Stats。禁用会移除统计条、监听器、定时器及本 tweak 的 IPC。
 
-测试也可独立运行，只需 Node.js 20 或更高版本；`validate` 和 `install:local` 才需要同级 Codex++ checkout。
+测试也可独立运行，只需 Node.js 20 或更高版本；原生 Zstd 压缩历史相关验证需要 Node.js 22.15 或更高的受支持版本。
+`validate` 和 `install:local` 才需要同级 Codex++ checkout。
 已在 Windows 的 Codex 桌面端验证实际加载；其他平台的原生界面尚未实测。
 
 ## 数据与兼容性
 
-- 运行端通过现有本地解析器增量读取 `$CODEX_HOME/sessions` 和 `archived_sessions`；未设置时使用 `~/.codex`。
-  支持续接日志、归档和分叉，按 `history_base` 的字节/记录数边界还原有效历史，排除废弃尾部和分叉前父历史。
-  计时与用量匹配、响应去重和跨轮累计平均公式保持一致。
+- 运行端通过现有本地解析器读取 `$CODEX_HOME/sessions` 和 `archived_sessions`；未设置时使用 `~/.codex`。
+  支持续接日志、归档和分叉，按 `history_base` 的字节/记录数边界还原有效历史，排除废弃尾部。
+  fork 的 TPS 会追溯声明的父会话前缀，父历史不会混入当前分支的其他计数。计时与用量匹配、响应去重和跨轮累计平均公式保持一致。
+- 运行端也可读取 `.jsonl.zst` 压缩历史，只解码所需前缀，不把解压后的聊天内容写入磁盘。
+  解压数据缓存和已打开的数据合计最多 256 MiB、64 个缓存项，每次最多读取 64 MiB 压缩输入；原生 Zstd 不可用或超出限制时，相关 TPS 保持未知。
+  同一日志同时存在普通和压缩副本时优先读取普通副本；远程接收端仍然只读取统计快照。
 - 快照位于 `$CODEX_HOME/.session-stats/<会话 UUID>.json`，只包含统计值、会话/发布者标识、递增版本及更新时间，
   不包含聊天正文、原始日志路径或认证信息；每份最多 16 KiB。本地底栏返回同一次成功发布的样本。
 - 运行端约每 2 秒检查已关注会话；数值变化立即原子替换快照，未变化时每 10 秒更新心跳。

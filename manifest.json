@@ -1,7 +1,7 @@
 {
   "id": "com.kpk.session-stats",
   "name": "Session Stats",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "githubRepo": "kpkhxlgy0/session-stats",
   "homepage": "https://github.com/kpkhxlgy0/session-stats",
   "iconUrl": "https://raw.githubusercontent.com/kpkhxlgy0/session-stats/v0.1.0/icon.svg",
