@@ -19,7 +19,7 @@
 - Immutable request nonces prevent cleanup of an expired file from deleting a new renewal. Multiple valid markers for one thread extend its lease to the maximum requestedAt. Expired valid markers may be removed; unknown/malformed files remain untouched.
 - Configured CODEX_HOME is resolved at runtime startup, supporting existing directory junctions; the generated directories and destinations themselves must remain safe.
 - Cancellation stops subsequent RPCs. A final native request already dispatched may complete; it can only create the validated short-lived marker. Expired page dispatches still cannot send.
-- Initial implementation excluded publication. The user subsequently authorized committing, pushing, publishing v0.3.0, updating the Store and verifying its live entry. No worktrees, raw-log writes or raw transcript disk caches are used.
+- Initial implementation excluded publication. The user subsequently authorized committing, pushing, publishing a new version, updating the Store and verifying its live entry. The release is v0.3.1 after the Windows CI validation adjustment below. No worktrees, raw-log writes or raw transcript disk caches are used.
 
 ## Validation ledger
 
@@ -42,3 +42,11 @@
 - These are two real-session measurements, not latency guarantees. Existing snapshot reads and first-time publication are different paths. Final snapshots and short-lived request markers are runtime outputs, not diagnostic artifacts.
 
 Ownership is disjoint. No repository writes during live probes: the installed development junction reloads on all repository changes.
+
+### Release validation adjustment
+
+The v0.3.0 tag was pushed before publication, but one Windows CI run failed the continuous-reader test; the same tag's other Windows run passed. No Release or Store update was published for that candidate. The existing tag is preserved, and the release advances to v0.3.1.
+
+The CI Node version, 22.23.4, reproduced `EPERM` from atomic rename after bounded retries were exhausted. The publisher correctly returned unavailable and preserved the old complete file. The test incorrectly required immediate publication while its tight reader could continuously hold the destination. It now allows bounded recovery using the existing three-second helper, retaining all concurrent-reader JSON checks and exact successful-version comparisons. A deterministic Windows sharing-conflict regression verifies retry exhaustion, unavailable status, preservation of the complete old snapshot, temporary-file cleanup, and recovery with a later revision. Runtime code is unchanged from the native-tested snapshot implementation.
+
+Verification on Windows with Node 22.23.4: the unchanged test failed 161 of 230 stress rounds, all with observed rename EPERM exhaustion. The corrected test passed 45 of 45 rounds in 30.5 seconds while recovering 57 temporary publication failures. The full final suite passed 260/260, tweak validation and whitespace checks passed, and the test-only adjustment received an independent review.

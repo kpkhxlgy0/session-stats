@@ -304,7 +304,15 @@ test('atomic replacement never exposes partial JSON and preserves unknown files 
     {
         for (tokens = 1201; tokens <= 1230; tokens++)
         {
-            const result = await f.publisher.getStats(ThreadId);
+            let result;
+            await eventually(async () =>
+            {
+                result = await f.publisher.getStats(ThreadId);
+                if (result.status === 'ok') return true;
+                assert.equal(result.unavailableReason, 'snapshot-publish-failed');
+                assert.equal(result.totalTokens, null);
+                return false;
+            });
             assert.equal(result.totalTokens, tokens);
             const written = await f.read(ThreadId);
             assert.equal(result.snapshotRevision, written.revision);
@@ -349,6 +357,38 @@ test('failed atomic replacement removes owned temporary files and preserves the 
     assert.equal(failed.unavailableReason, 'snapshot-publish-failed');
     assert.equal((await f.read(ThreadId)).stats.totalTokens, 1200);
     assert.deepEqual(await fs.readdir(path.dirname(f.filename(ThreadId))), [`${ThreadId}.json`]);
+});
+
+test('Windows sharing conflicts exhaust bounded retries and recover on the next request',
+    { skip: process.platform !== 'win32' }, async t =>
+{
+    let tokens = 1200;
+    const f = await fixture(t, { store: { getStats: async () => ({ ...Stats, totalTokens: tokens }) } });
+    await f.publisher.getStats(ThreadId);
+    const before = await f.read(ThreadId);
+    const originalRename = fs.rename;
+    let attempts = 0, failed;
+    fs.rename = async (source, destination) =>
+    {
+        if (destination !== f.filename(ThreadId)) return originalRename(source, destination);
+        attempts++;
+        throw Object.assign(new Error('Injected Windows sharing conflict'), { code: 'EPERM' });
+    };
+    try { tokens = 1201; failed = await f.publisher.getStats(ThreadId); }
+    finally { fs.rename = originalRename; }
+    assert.equal(attempts, 7);
+    assert.equal(failed.status, 'unavailable');
+    assert.equal(failed.unavailableReason, 'snapshot-publish-failed');
+    assert.equal(failed.totalTokens, null);
+    assert.deepEqual(await f.read(ThreadId), before);
+    assert.deepEqual(await fs.readdir(path.dirname(f.filename(ThreadId))), [`${ThreadId}.json`]);
+    const recovered = await f.publisher.getStats(ThreadId);
+    const written = await f.read(ThreadId);
+    assert.equal(recovered.status, 'ok');
+    assert.equal(recovered.totalTokens, tokens);
+    assert.ok(recovered.snapshotRevision > before.revision);
+    assert.equal(recovered.snapshotRevision, written.revision);
+    assert.equal(recovered.totalTokens, written.stats.totalTokens);
 });
 
 test('disposal during temporary-file creation cleans only its own file and cannot rename afterward', async t =>

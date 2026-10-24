@@ -48,7 +48,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.3.0](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.3.0)。
+版本：[v0.3.1](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.3.1)。
 
 ## 本地 Inject / Uninject
 
