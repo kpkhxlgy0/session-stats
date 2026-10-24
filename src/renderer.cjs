@@ -62,8 +62,24 @@ function render(entry, stats) {
     set("tps", `${Number.isFinite(s.tps) && s.tps > 0 ? `${s.tpsHeld ? "~" : ""}${Math.round(s.tps)}` : "—"} tok/s`);
     set("tokens", `${compact(s.totalTokens)} tok`);
     set("cache", `Cache hit ${Number.isFinite(s.cacheHit) ? `${Math.round(s.cacheHit * 100)}%` : "—"}`);
-    const pending = stats?.status === "not-found" ? "等待当前会话的用量日志" : "当前会话暂无可用统计";
-    entry.bar.title = usable ? "" : pending;
+    const pending = {
+        "snapshot-loading": "正在读取运行端统计快照",
+        "snapshot-missing": "运行端尚未生成统计快照，请确认运行端已更新并启用 Session Stats",
+        "snapshot-read-failed": "统计快照连接暂不可用，正在重试",
+        "snapshot-expired": "运行端统计快照已过期，等待更新",
+        "snapshot-future": "设备时间不一致，无法确认统计快照时效",
+        "snapshot-identity": "运行端统计快照与当前会话不匹配",
+        "snapshot-invalid": "运行端统计快照数据无效",
+        "snapshot-replay": "等待运行端更新统计快照版本",
+        "source-unavailable": "运行端暂时无法读取当前会话统计",
+        "snapshot-source-unavailable": "运行端暂时无法读取当前会话统计",
+        "snapshot-publish-failed": "统计快照暂时未能写入，等待重试",
+    }[stats?.unavailableReason] ?? (stats?.status === "not-found"
+        ? "等待当前会话的用量日志" : "当前会话暂无可用统计");
+    entry.bar.title = !usable ? pending : stats.source === "snapshot"
+        ? "运行端共享统计快照" + (Number.isSafeInteger(stats.snapshotGeneratedAt)
+            ? `，更新于 ${new Date(stats.snapshotGeneratedAt).toLocaleTimeString()}` : "")
+        : "";
     entry.fields.tokens.title = usable ? `累计 ${s.totalTokens ?? "—"} tokens；输入 ${s.inputTokens ?? "—"}，`
         + `输出 ${s.outputTokens ?? "—"}。缓存输入已包含在输入中。` : pending;
     entry.fields.cache.title = usable ? `缓存输入 ${s.cachedInputTokens ?? "—"} ÷ 总输入 ${s.inputTokens ?? "—"}` : pending;
@@ -114,7 +130,8 @@ function startRenderer(api, options = {}) {
             if (stats.status === "ok" && !entry.logged) {
                 entry.logged = true;
                 api.log.info(`footer ready: ${hostId}/${threadId}; turns=${stats.turns}, `
-                    + `steps=${stats.steps}, tps=${stats.tps}`);
+                    + `steps=${stats.steps}, tps=${stats.tps}, source=${stats.source ?? "local"}`
+                    + (Number.isSafeInteger(stats.snapshotRevision) ? `, revision=${stats.snapshotRevision}` : ""));
             }
         } catch {
             if (!stopped && entries.get(root) === entry && entry.inflight === request) render(entry, null);

@@ -208,3 +208,23 @@ test("remote log pending text does not describe the source as local", async (t) 
     assert.match(bar.title, /等待.*日志/);
     assert.doesNotMatch(bar.title, /本地/);
 });
+
+test("snapshot tooltips explain loading, missing producers and shared samples", async t => {
+    for (const [sample, title] of [
+        [{ status: "unavailable", unavailableReason: "snapshot-loading" }, /正在读取运行端统计快照/],
+        [{ status: "unavailable", unavailableReason: "snapshot-expired" }, /快照已过期/],
+        [{ ...stats, source: "snapshot", snapshotGeneratedAt: 1792860000000 }, /运行端共享统计快照/],
+        [{ status: "unavailable", unavailableReason: "snapshot-missing" }, /运行端.*启用 Session Stats/],
+    ]) {
+        const f = fixture();
+        t.after(() => f.dom.window.close());
+        f.fiber.return.memoizedProps.value.hostId = "remote-control:example";
+        f.api.ipc.invoke = async (_channel, bound) => ({ ...sample, ...bound });
+        const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
+        t.after(() => controller.stop());
+        await settle(f.dom);
+        const bar = f.root.querySelector("[data-session-stats]");
+        assert.match(bar.title, title);
+        assert.match(bar.textContent, sample.status === "ok" ? /209 tok\/s/ : /— turns.*— tok\/s/);
+    }
+});
