@@ -137,7 +137,7 @@ test('tool activity holds the measurement until newer official usage arrives', (
     assert.equal(metrics.snapshot().tpsHeld, false);
 });
 
-test('a newer turn clears speed and never borrows earlier turn tokens or intervals', () =>
+test('a newer turn retains the session mean without pairing its usage with earlier timing', () =>
 {
     const metrics = createMetrics();
     metrics.ingest(event('task_started', 'turn-1'));
@@ -145,12 +145,126 @@ test('a newer turn clears speed and never borrows earlier turn tokens or interva
     metrics.ingest(usage('turn-1', 'response-1', 200));
     metrics.ingest(event('task_complete', 'turn-1'));
     metrics.ingest(event('task_started', 'turn-2'));
-    assert.equal(metrics.snapshot().tps, null);
-    assert.equal(metrics.snapshot().modelActiveMs, 0);
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().tpsHeld, true);
+    assert.equal(metrics.snapshot().modelActiveMs, 1000);
     metrics.ingest(usage('turn-2', 'response-2', 100));
-    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().tps, 200);
     metrics.ingest(usage('turn-1', 'response-1', 200));
+    assert.equal(metrics.snapshot().tps, 200);
+});
+
+function measuredTurn(metrics, id, output, start, end)
+{
+    metrics.ingest(event('task_started', id));
+    metrics.ingest(item(id, 'AgentMessage', `message-${id}`, start, end));
+    metrics.ingest(usage(id, `response-${id}`, output));
+    metrics.ingest(event('task_complete', id));
+}
+
+test('session TPS weights unequal turns by measured time and excludes user and tool waiting', () =>
+{
+    const metrics = createMetrics();
+    measuredTurn(metrics, 'one', 1000, 0, 5000);
+    metrics.ingest(event('task_started', 'two'));
+    metrics.ingest(item('two', 'Reasoning', 'r2', 100000, 110000));
+    metrics.ingest(item('two', 'CommandExecution', 'tool2', 110000, 140000));
+    metrics.ingest(item('two', 'AgentMessage', 'm2', 140000, 150000));
+    metrics.ingest(usage('two', 'response-two', 1000));
+    metrics.ingest(event('task_complete', 'two'));
+    assert.equal(metrics.snapshot().tps, 80);
+    assert.equal(metrics.snapshot().modelActiveMs, 25000);
+    assert.equal(metrics.snapshot().tpsHeld, false);
+});
+
+test('pending model intervals do not change the session denominator until usage catches up', () =>
+{
+    const metrics = createMetrics();
+    measuredTurn(metrics, 'one', 1000, 0, 5000);
+    metrics.ingest(event('task_started', 'two'));
+    metrics.ingest(item('two', 'AgentMessage', 'm2', 10000, 15000));
+    metrics.ingest(usage('two', 'response-two', 500));
+    assert.equal(metrics.snapshot().tps, 150);
+    metrics.ingest(item('two', 'Reasoning', 'r2', 15000, 30000));
+    assert.equal(metrics.snapshot().tps, 150);
+    assert.equal(metrics.snapshot().modelActiveMs, 10000);
+    assert.equal(metrics.snapshot().tpsHeld, true);
+    metrics.ingest(usage('two', 'response-three', 500));
+    assert.equal(metrics.snapshot().tps, 80);
+    assert.equal(metrics.snapshot().modelActiveMs, 25000);
+    assert.equal(metrics.snapshot().tpsHeld, false);
+});
+
+test('incomplete turns contribute neither tokens nor duration while valid zero-output turns do', () =>
+{
+    const metrics = createMetrics();
+    measuredTurn(metrics, 'valid', 1000, 0, 5000);
+    measuredTurn(metrics, 'missing-usage', undefined, 10000, 20000);
+    measuredTurn(metrics, 'missing-timing', 9999, undefined, 30000);
+    measuredTurn(metrics, 'too-short', 9999, 40000, 40050);
+    metrics.ingest(usage('missing-start', 'orphan-response', 9999));
+    metrics.ingest(item('missing-start', 'AgentMessage', 'orphan-message', 50000, 60000));
+    metrics.ingest(event('task_complete', 'missing-start'));
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().modelActiveMs, 5000);
+    measuredTurn(metrics, 'zero-output', 0, 70000, 75000);
+    assert.equal(metrics.snapshot().tps, 100);
+    assert.equal(metrics.snapshot().modelActiveMs, 10000);
+});
+
+test('late timing replaces a completed turn contribution and replay cannot accumulate it again', () =>
+{
+    const metrics = createMetrics();
+    measuredTurn(metrics, 'one', 1000, 0, 5000);
+    measuredTurn(metrics, 'two', 1000, 10000, 15000);
+    const late = item('one', 'Reasoning', 'late-one', 5000, 10000);
+    metrics.ingest(late);
+    assert.equal(metrics.snapshot().tps, 2000 / 15);
+    assert.equal(metrics.snapshot().modelActiveMs, 15000);
+    metrics.ingest(late);
+    metrics.ingest(usage('one', 'response-one', 1000));
+    metrics.ingest(event('task_complete', 'one'));
+    assert.equal(metrics.snapshot().tps, 2000 / 15);
+    assert.equal(metrics.snapshot().modelActiveMs, 15000);
+    metrics.ingest(item('one', 'Reasoning', 'invalid-late', undefined, 20000));
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().modelActiveMs, 5000);
+});
+
+test('missing response identity invalidates an earlier matched sample without erasing other turns', () =>
+{
+    const metrics = createMetrics();
+    measuredTurn(metrics, 'one', 1000, 0, 5000);
+    measuredTurn(metrics, 'two', 1000, 10000, 30000);
+    metrics.ingest(usage('two', undefined, 999));
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().modelActiveMs, 5000);
+});
+
+test('invalid timing in the active turn removes its cached contribution immediately', () =>
+{
+    const metrics = createMetrics();
+    measuredTurn(metrics, 'one', 1000, 0, 5000);
+    metrics.ingest(event('task_started', 'two'));
+    metrics.ingest(item('two', 'AgentMessage', 'm2', 10000, 15000));
+    metrics.ingest(usage('two', 'response-two', 500));
+    assert.equal(metrics.snapshot().tps, 150);
+    metrics.ingest(item('two', 'Reasoning', 'invalid', undefined, 20000));
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().modelActiveMs, 5000);
+    assert.equal(metrics.snapshot().tpsHeld, true);
+    metrics.ingest(event('task_complete', 'two'));
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().tpsHeld, false);
+});
+
+test('unsafe aggregate output does not produce a plausible session speed', () =>
+{
+    const metrics = createMetrics();
+    measuredTurn(metrics, 'one', Number.MAX_SAFE_INTEGER, 0, 1000);
+    measuredTurn(metrics, 'two', 1, 2000, 3000);
     assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().tpsHeld, false);
 });
 
 test('checkpoint history preserves cumulative totals without fabricating incomplete-turn speed', () =>

@@ -70,12 +70,12 @@ function assertMerged(stats)
     assert.equal(stats.inputTokens, 120);
     assert.equal(stats.cachedInputTokens, 50);
     assert.equal(stats.cacheHit, 50 / 120);
-    assert.equal(stats.tps, 10);
-    assert.equal(stats.modelActiveMs, 2000);
+    assert.equal(stats.tps, 7.5);
+    assert.equal(stats.modelActiveMs, 4000);
     assert.equal(stats.activeTurn, false);
 }
 
-test('uses the history boundary instead of the abandoned original tail, preserving latest TPS and totals', async t =>
+test('uses the history boundary instead of the abandoned original tail for session-average TPS and totals', async t =>
 {
     const f = await fixture(t);
     await f.continueLog();
@@ -120,7 +120,8 @@ test('deduplicates replayed responses and repeated polls while incrementally rea
         assert.equal(result.turns, 3);
         assert.equal(result.steps, 3);
         assert.equal(result.totalTokens, 220);
-        assert.equal(result.tps, 20);
+        assert.equal(result.tps, 70 / 6);
+        assert.equal(result.modelActiveMs, 6000);
     }
 });
 
@@ -177,6 +178,7 @@ test('resolves the history boundary again after a failed read and same-path repl
     assert.equal(stats.steps, 1);
     assert.equal(stats.totalTokens, 220);
     assert.equal(stats.tps, 20);
+    assert.equal(stats.modelActiveMs, 2000);
     t.mock.timers.tick(16000);
     assert.deepEqual(await f.store.getStats(ThreadId), stats);
 });
@@ -198,7 +200,8 @@ test('follows a uniquely matching continuation chain without summing cumulative 
     assert.equal(stats.turns, 3);
     assert.equal(stats.steps, 3);
     assert.equal(stats.totalTokens, 220);
-    assert.equal(stats.tps, 20);
+    assert.equal(stats.tps, 70 / 6);
+    assert.equal(stats.modelActiveMs, 6000);
     t.mock.timers.tick(16000);
     assert.deepEqual(await f.store.getStats(ThreadId), stats);
 });

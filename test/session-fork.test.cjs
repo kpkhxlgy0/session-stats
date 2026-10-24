@@ -64,6 +64,7 @@ function assertFirst(stats)
     assert.equal(stats.totalTokens, 120); assert.equal(stats.inputTokens, 100);
     assert.equal(stats.outputTokens, 20); assert.equal(stats.cachedInputTokens, 50);
     assert.equal(stats.cacheHit, 0.5); assert.equal(stats.tps, 10);
+    assert.equal(stats.modelActiveMs, 2000);
 }
 
 test('a fork uses only its own responses even if its parent history is absent or compressed', async t =>
@@ -90,11 +91,12 @@ test('post-fork usage deduplicates response replay and ignores inherited cumulat
     {
         assert.equal(stats.turns, 2); assert.equal(stats.steps, 2);
         assert.equal(stats.totalTokens, 350); assert.equal(stats.cachedInputTokens, 200);
-        assert.equal(stats.cacheHit, 2 / 3); assert.equal(stats.tps, 15);
+        assert.equal(stats.cacheHit, 2 / 3); assert.equal(stats.tps, 12.5);
+        assert.equal(stats.modelActiveMs, 4000);
     }
 });
 
-test('continuations of a fork retain post-fork history and use cumulative record ordinals', async t =>
+test('continuations of a fork average only post-fork history and use cumulative record ordinals', async t =>
 {
     const f = await fixture(t);
     await fs.appendFile(f.file, lines(turn('abandoned', 999, 999, 0), 15));
@@ -105,7 +107,8 @@ test('continuations of a fork retain post-fork history and use cumulative record
     await f.write(`03-00-00-${Child}_${Segment}`, continuation);
     const stats = await f.store.getStats(Child);
     assert.equal(stats.status, 'ok'); assert.equal(stats.turns, 2); assert.equal(stats.steps, 2);
-    assert.equal(stats.totalTokens, 350); assert.equal(stats.tps, 15);
+    assert.equal(stats.totalTokens, 350); assert.equal(stats.tps, 12.5);
+    assert.equal(stats.modelActiveMs, 4000);
 });
 
 test('invalid fork boundaries cannot disable the history checks', async t =>
@@ -135,7 +138,8 @@ test('later fork continuations can identify the previous segment by its filename
     const stats = await f.store.getStats(Child);
     assert.equal(stats.status, 'ok'); assert.equal(stats.turns, 3); assert.equal(stats.steps, 3);
     assert.equal(stats.totalTokens, 690); assert.equal(stats.cachedInputTokens, 450);
-    assert.equal(stats.cacheHit, 0.75); assert.equal(stats.tps, 20);
+    assert.equal(stats.cacheHit, 0.75); assert.equal(stats.tps, 15);
+    assert.equal(stats.modelActiveMs, 6000);
     assert.deepEqual(await f.store.getStats(Child), stats);
 });
 
@@ -161,4 +165,5 @@ test('a response without an identity leaves fork totals unknown even after later
     assert.equal(stats.inputTokens, null); assert.equal(stats.outputTokens, null);
     assert.equal(stats.cachedInputTokens, null); assert.equal(stats.cacheHit, null);
     assert.equal(stats.tps, 15);
+    assert.equal(stats.modelActiveMs, 2000);
 });

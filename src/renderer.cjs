@@ -45,8 +45,9 @@ function makeBar(doc) {
     anchor.append(bar);
     fields.turns.title = "当前会话的轮次，按 turn_id 去重";
     fields.steps.title = "当前会话的模型调用次数，按 response_id 去重；不等于工具调用次数";
-    fields.tps.title = "本轮平均 TPS：输出 Token（含推理）÷ 模型活跃时间；重叠区间只算一次，排除工具等待。"
-        + "按响应完成更新；~ 表示暂时保留上次有效速度。";
+    fields.tps.title = "会话平均 TPS：有效轮次的输出 Token（含推理）总和 ÷ 对应模型活跃时间总和；"
+        + "轮内重叠区间只算一次，排除工具执行和用户等待。按响应完成更新；"
+        + "~ 表示等待新样本，暂时保留已有会话平均值。";
     return { anchor, bar, fields };
 }
 

@@ -44,7 +44,7 @@ function measure(turn)
     const duration = unionDuration(turn.intervals);
     if (!turn.started || !turn.hasUsage || turn.incompleteUsage || turn.incompleteTiming
         || duration < MinimumModelMs || !Number.isSafeInteger(turn.outputTokens)) return null;
-    return turn.outputTokens * 1000 / duration;
+    return { outputTokens: turn.outputTokens, modelActiveMs: duration };
 }
 
 function createMetrics({ responseTotals = false } = {})
@@ -70,7 +70,7 @@ function createMetrics({ responseTotals = false } = {})
                 incompleteUsage: false,
                 incompleteTiming: false,
                 pendingActivity: false,
-                tps: null
+                sample: null
             });
             currentTurnId = turnId;
         }
@@ -99,7 +99,11 @@ function createMetrics({ responseTotals = false } = {})
         else totals = readTotals(payload.thread_token_usage) || totals;
         if (!hasResponseId)
         {
-            if (turn) turn.incompleteUsage = true;
+            if (turn)
+            {
+                turn.incompleteUsage = true;
+                turn.sample = null;
+            }
             return;
         }
         responses.add(payload.response_id);
@@ -108,7 +112,7 @@ function createMetrics({ responseTotals = false } = {})
         turn.hasUsage = true;
         if (output === null) turn.incompleteUsage = true;
         else turn.outputTokens += output;
-        turn.tps = measure(turn);
+        turn.sample = measure(turn);
         turn.pendingActivity = false;
     }
 
@@ -134,11 +138,15 @@ function createMetrics({ responseTotals = false } = {})
             {
                 turn.intervals.push([start, end]);
             }
-            else turn.incompleteTiming = true;
+            else
+            {
+                turn.incompleteTiming = true;
+                turn.sample = null;
+            }
         }
         if (turn.completed)
         {
-            turn.tps = measure(turn);
+            turn.sample = measure(turn);
             turn.pendingActivity = false;
         }
     }
@@ -158,7 +166,7 @@ function createMetrics({ responseTotals = false } = {})
                 else
                 {
                     turn.completed = true;
-                    turn.tps = measure(turn);
+                    turn.sample = measure(turn);
                     turn.pendingActivity = false;
                 }
             }
@@ -173,6 +181,18 @@ function createMetrics({ responseTotals = false } = {})
     function snapshot()
     {
         const turn = turns.get(currentTurnId);
+        let measuredOutput = 0;
+        let modelActiveMs = 0;
+        for (const measured of turns.values())
+        {
+            // Keep each usage/duration pair together while newer activity is pending.
+            if (!measured.sample) continue;
+            measuredOutput += measured.sample.outputTokens;
+            modelActiveMs += measured.sample.modelActiveMs;
+        }
+        const tps = Number.isSafeInteger(measuredOutput) && Number.isFinite(modelActiveMs)
+            && modelActiveMs >= MinimumModelMs && modelActiveMs <= Number.MAX_SAFE_INTEGER
+            ? measuredOutput * 1000 / modelActiveMs : null;
         const cacheHit = totals.inputTokens > 0 && totals.cachedInputTokens !== null
             && totals.cachedInputTokens <= totals.inputTokens
             ? totals.cachedInputTokens / totals.inputTokens : null;
@@ -181,10 +201,11 @@ function createMetrics({ responseTotals = false } = {})
             steps: responses.size || null,
             ...totals,
             cacheHit,
-            tps: turn?.tps ?? null,
-            tpsHeld: Boolean(turn && turn.tps !== null && turn.pendingActivity && !turn.completed),
+            tps,
+            tpsHeld: Boolean(tps !== null && turn?.started && !turn.completed
+                && (turn.pendingActivity || !turn.sample)),
             activeTurn: Boolean(turn?.started && !turn.completed),
-            modelActiveMs: turn ? unionDuration(turn.intervals) : 0
+            modelActiveMs
         };
     }
 

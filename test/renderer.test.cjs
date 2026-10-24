@@ -98,15 +98,17 @@ test("an explicit rejected main-world binding cannot fall back to a stale DOM th
     assert.equal(f.root.querySelector("[data-session-stats]"), null);
 });
 
-test("footer displays the five metrics without context occupancy and cleans up", async () => {
+test("footer displays the five metrics without context occupancy and cleans up", async t => {
     const f = fixture();
     const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
+    t.after(() => controller.stop());
     await settle(f.dom);
     const bar = f.root.querySelector("[data-session-stats]");
     assert.ok(bar, "mounts beneath the composer content");
     assert.match(bar.textContent, /2 turns.*33 steps.*209 tok\/s.*11\.7M tok.*Cache hit 96%/);
     assert.doesNotMatch(bar.textContent, /context|上下文|42%/i);
     assert.match(bar.querySelector('[data-stat="tps"]').title, /工具/);
+    assert.match(bar.querySelector('[data-stat="tps"]').title, /会话平均/);
     f.root.appendChild(f.dom.window.document.createElement("span"));
     await settle(f.dom);
     assert.equal(f.root.querySelectorAll("[data-session-stats]").length, 1);
