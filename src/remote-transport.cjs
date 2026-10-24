@@ -1,7 +1,7 @@
 "use strict";
 
 const { randomUUID } = require("node:crypto");
-const ReadMethods = new Set(["thread/read", "fs/getMetadata", "fs/readFile"]);
+const ReadMethods = new Set(["thread/read", "fs/getMetadata", "fs/readFile", "fs/readDirectory"]);
 
 // 此函数整体序列化到主页面，使用现有连接；不访问 Node 或更改应用的消息处理器。
 function requestInPage(options) {
@@ -162,7 +162,7 @@ function requestInPage(options) {
     });
 }
 
-function createRemoteTransport({ timeoutMs = 30000, maxChars = 48 * 1024 * 1024 } = {}) {
+function createRemoteTransport({ timeoutMs, maxChars } = {}) {
     const pending = new Set();
     const cancelEvent = `session-stats-cancel-${randomUUID()}`;
     let disposed = false;
@@ -177,8 +177,11 @@ function createRemoteTransport({ timeoutMs = 30000, maxChars = 48 * 1024 * 1024 
 
     async function request(frame, hostId, method, params) {
         if (disposed || !ReadMethods.has(method)) throw new Error("Remote stats request unavailable");
+        const fileRequest = method === "fs/readFile";
+        const requestTimeoutMs = timeoutMs ?? (fileRequest ? 120000 : 30000);
+        const responseLimit = maxChars ?? (fileRequest ? 192 : 48) * 1024 * 1024;
         const options = { hostId, id: `session-stats:${randomUUID()}`, method, params,
-            expiresAtMs: Date.now() + timeoutMs, maxChars, cancelEvent };
+            expiresAtMs: Date.now() + requestTimeoutMs, maxChars: responseLimit, cancelEvent };
         let timer;
         const entry = { frame };
         pending.add(entry);
@@ -188,7 +191,7 @@ function createRemoteTransport({ timeoutMs = 30000, maxChars = 48 * 1024 * 1024 
                 timer = setTimeout(() => {
                     cancelPage(frame, options.id);
                     reject(new Error("Remote session stats request timed out"));
-                }, timeoutMs + 1000);
+                }, requestTimeoutMs + 1000);
                 Promise.resolve(frame.executeJavaScript(`(${requestInPage.toString()})(${JSON.stringify(options)})`))
                     .then(resolve, reject);
             });

@@ -29,11 +29,12 @@ const EmptyStats = Object.freeze({
     modelActiveMs: 0,
 });
 
-function createSessionStore({ codexHome, createMetrics } = {})
+function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi = path,
+    findSources, validateRecord } = {})
 {
     const makeMetrics = createMetrics || (options => require('./metrics.cjs').createMetrics(options));
     const roots = typeof codexHome === 'string' && codexHome.length
-        ? ['sessions', 'archived_sessions'].map(name => path.join(codexHome, name))
+        ? ['sessions', 'archived_sessions'].map(name => pathApi.join(codexHome, name))
         : [];
     const sessions = new Map();
     let index = new Map();
@@ -70,7 +71,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
     {
         try
         {
-            const handle = await fs.opendir(directory);
+            const handle = await fileSystem.opendir(directory);
             yield* handle;
         }
         catch (error)
@@ -110,7 +111,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
                     if (child.isDirectory() && depth < 3
                         && directoryCount + directories.length + subdirectories.length < MaxDirectories)
                     {
-                        subdirectories.push({ directory: path.join(directory, child.name), depth: depth + 1 });
+                        subdirectories.push({ directory: pathApi.join(directory, child.name), depth: depth + 1 });
                     }
                     else if (child.isFile())
                     {
@@ -118,7 +119,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
                         if (id && indexedCount < MaxIndexEntries)
                         {
                             if (!found.has(id)) found.set(id, []);
-                            found.get(id).push(path.join(directory, child.name));
+                            found.get(id).push(pathApi.join(directory, child.name));
                             indexedCount++;
                         }
                     }
@@ -143,7 +144,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
         }
     }
 
-    async function locate(threadId)
+    async function locateLocal(threadId)
     {
         await refreshIndex();
         const found = new Set(index.get(threadId) || []);
@@ -156,7 +157,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
                 const date = new Date(timestamp + offset * 86400000);
                 const parts = [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()]
                     .map((value, i) => String(value).padStart(i === 0 ? 4 : 2, '0'));
-                for (const root of roots) directories.push(path.join(root, ...parts));
+                for (const root of roots) directories.push(pathApi.join(root, ...parts));
             }
         }
         for (const directory of directories)
@@ -167,21 +168,29 @@ function createSessionStore({ codexHome, createMetrics } = {})
             {
                 if (child.isFile() && sessionId(child.name) === threadId)
                 {
-                    found.add(path.join(directory, child.name));
+                    found.add(pathApi.join(directory, child.name));
                 }
                 if (++count >= MaxFilenames || disposed) break;
             }
         }
+        return found;
+    }
+
+    async function locate(threadId)
+    {
+        const found = new Set(findSources ? await findSources(threadId) : await locateLocal(threadId));
+        const candidates = [...found].filter(filename => typeof filename === 'string'
+            && sessionId(pathApi.basename(filename)) === threadId);
         // 同名归档副本只读一份，优先仍在 sessions 中的副本。
         const unique = new Map();
-        const isArchived = filename => !filename.startsWith(roots[0] + path.sep);
-        for (const filename of [...found].sort((a, b) => Number(isArchived(a)) - Number(isArchived(b))))
+        const isArchived = filename => !filename.startsWith(roots[0] + pathApi.sep);
+        for (const filename of candidates.sort((a, b) => Number(isArchived(a)) - Number(isArchived(b))))
         {
             try
             {
-                if ((await fs.stat(filename)).isFile() && !unique.has(path.basename(filename)))
+                if ((await fileSystem.stat(filename)).isFile() && !unique.has(pathApi.basename(filename)))
                 {
-                    unique.set(path.basename(filename), filename);
+                    unique.set(pathApi.basename(filename), filename);
                 }
             }
             catch (error)
@@ -192,15 +201,15 @@ function createSessionStore({ codexHome, createMetrics } = {})
         if (unique.size > MaxSources) throw new Error('Too many rollout sources');
         return [...unique.values()].sort((a, b) =>
         {
-            const left = SessionPattern.exec(path.basename(a));
-            const right = SessionPattern.exec(path.basename(b));
+            const left = SessionPattern.exec(pathApi.basename(a));
+            const right = SessionPattern.exec(pathApi.basename(b));
             return left[1].localeCompare(right[1]) || (left[3] || '').localeCompare(right[3] || '');
         });
     }
 
     async function metadata(filename, threadId)
     {
-        const handle = await fs.open(filename, 'r');
+        const handle = await fileSystem.open(filename, 'r');
         try
         {
             const chunks = [];
@@ -228,7 +237,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
                     throw new Error('Invalid rollout ordinal');
                 return { payload: meta, startOrdinal: record.ordinal ?? 0, hasOrdinal: record.ordinal !== undefined };
             }
-            if (SessionPattern.exec(path.basename(filename))[3]) throw new Error('Missing continuation metadata');
+            if (SessionPattern.exec(pathApi.basename(filename))[3]) throw new Error('Missing continuation metadata');
             return { payload: {}, startOrdinal: 0, hasOrdinal: false };
         }
         finally { await handle.close(); }
@@ -236,7 +245,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
 
     async function matchesBoundary(filename, boundary, startOrdinal)
     {
-        const handle = await fs.open(filename, 'r');
+        const handle = await fileSystem.open(filename, 'r');
         try
         {
             if ((await handle.stat()).size < boundary.end_byte_offset) return false;
@@ -289,7 +298,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
             // 只续接当前会话自己的分段；分叉起点之前的父历史不参与统计。
             for (const previous of filenames.slice(0, filenames.indexOf(filename)))
             {
-                const segmentId = SessionPattern.exec(path.basename(previous))[3];
+                const segmentId = SessionPattern.exec(pathApi.basename(previous))[3];
                 if (boundary.thread_id.toLowerCase() !== threadId
                     && segmentId?.toLowerCase() !== boundary.thread_id.toLowerCase()) continue;
                 const previousHead = await metadata(previous, threadId);
@@ -332,7 +341,11 @@ function createSessionStore({ codexHome, createMetrics } = {})
                     {
                         record = undefined;
                     }
-                    if (record !== undefined) metrics.ingest(record);
+                    if (record !== undefined)
+                    {
+                        if (validateRecord && validateRecord(record) === false) throw new Error('Invalid rollout record');
+                        metrics.ingest(record);
+                    }
                 }
             }
             if (newline === -1) break;
@@ -383,7 +396,7 @@ function createSessionStore({ codexHome, createMetrics } = {})
             let changed = false;
             for (const source of entry.sources)
             {
-                const handle = await fs.open(source.path, 'r');
+                const handle = await fileSystem.open(source.path, 'r');
                 files.push({ handle });
                 const stat = await handle.stat();
                 if (!stat.isFile() || source.limit !== null && stat.size < source.limit)

@@ -58,11 +58,14 @@ test('local and remote stores average the same measured conversation and hold it
             assert.deepEqual(params, { threadId: ThreadId, includeTurns: false });
             return { thread: { id: ThreadId, path: remotePath } };
         }
-        assert.deepEqual(params, { path: remotePath });
         if (method === 'fs/getMetadata')
         {
+            if (params.path === '/home/user/.codex/sessions')
+                return { isFile: false, isDirectory: true, isSymlink: false, createdAtMs: 1, modifiedAtMs: 1 };
+            assert.deepEqual(params, { path: remotePath });
             return { isFile: true, isDirectory: false, isSymlink: false, createdAtMs: 1, modifiedAtMs };
         }
+        assert.deepEqual(params, { path: remotePath });
         assert.equal(method, 'fs/readFile');
         return { dataBase64: Buffer.from(content).toString('base64') };
     }

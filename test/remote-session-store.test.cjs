@@ -61,6 +61,8 @@ function remote(content = lines(usage('response-one', 1200)), threadId = ThreadI
             assert.deepEqual(params, { threadId, includeTurns: false });
             return { thread: { id: state.threadId, path: state.path } };
         }
+        if (method === 'fs/getMetadata' && params.path !== state.path)
+            return { isFile: false, isDirectory: true, isSymlink: false, createdAtMs: 1, modifiedAtMs: 2 };
         assert.deepEqual(params, { path: state.path });
         if (method === 'fs/getMetadata') return { ...state.metadata };
         assert.equal(method, 'fs/readFile');
@@ -82,6 +84,37 @@ function fixture(t)
     t.after(() => store.dispose());
     return { store, clock, identity };
 }
+
+test('validates optional lower-only memory budgets', () =>
+{
+    for (const [name, maximum] of [['maxFileBytes', 128 * 1024 * 1024], ['maxHistoryBytes', 256 * 1024 * 1024]])
+    {
+        for (const value of [0, -1, 1.5, NaN, Infinity, maximum + 1, '1024'])
+            assert.throws(() => createRemoteSessionStore({ [name]: value }), RangeError);
+    }
+});
+
+test('bounds oversized cache records across path churn and retries an evicted path', async t =>
+{
+    const clock = { value: 0 };
+    const store = createRemoteSessionStore({ now: () => clock.value, maxFileBytes: 16 });
+    t.after(() => store.dispose());
+    const source = remote();
+    const firstPath = source.path;
+    const identity = { hostId: HostId, threadId: ThreadId };
+    for (let index = 0; index < 1025; index++)
+    {
+        source.path = index === 0 ? firstPath
+            : `/home/user/.codex/sessions/rollout-date-${index}-${ThreadId}.jsonl`;
+        clock.value += 60000;
+        await store.getStats(identity, source.request);
+    }
+    const reads = source.calls.filter(call => call.method === 'fs/readFile').length;
+    source.path = firstPath;
+    clock.value += 60000;
+    assert.equal((await store.getStats(identity, source.request)).status, 'unavailable');
+    assert.equal(source.calls.filter(call => call.method === 'fs/readFile').length, reads + 1);
+});
 
 test('uses official metrics and returns only stats plus remote identity', async t =>
 {
@@ -141,7 +174,7 @@ test('isolates the same thread on different hosts', async t =>
     assert.equal(other.totalTokens, 2100);
     assert.equal(other.hostId, OtherHostId);
     assert.equal((await store.getStats(identity, first.request)).totalTokens, 1200);
-    assert.equal(second.calls.length, 3);
+    assert.equal(second.calls.filter(call => call.method === 'fs/readFile').length, 1);
 });
 
 test('isolates different threads on the same host and returns independent snapshots', async t =>
@@ -207,12 +240,11 @@ test('throttles polling and reuses a snapshot when metadata is unchanged', async
     await store.getStats(identity, source.request);
     clock.value += 14999;
     assert.equal((await store.getStats(identity, source.request)).status, 'ok');
-    assert.equal(source.calls.length, 3);
+    assert.equal(source.calls.filter(call => call.method === 'fs/readFile').length, 1);
     clock.value++;
     assert.equal((await store.getStats(identity, source.request)).totalTokens, 1200);
-    assert.deepEqual(source.calls.map(call => call.method), [
-        'thread/read', 'fs/getMetadata', 'fs/readFile', 'thread/read', 'fs/getMetadata',
-    ]);
+    assert.equal(source.calls.filter(call => call.method === 'fs/readFile').length, 1);
+    assert.equal(source.calls.filter(call => call.method === 'thread/read').length, 4);
 });
 
 test('uses a newly resolved path even when its timestamps match the previous path', async t =>
@@ -237,7 +269,7 @@ test('coalesces concurrent reads of one remote session', async t =>
         assert.equal(result.status, 'ok');
         assert.equal(result.totalTokens, 1200);
     }
-    assert.equal(source.calls.length, 3);
+    assert.equal(source.calls.filter(call => call.method === 'fs/readFile').length, 1);
 });
 
 test('reports failed reads as unavailable and throttles retries without using stale metrics', async t =>
@@ -351,6 +383,11 @@ test('rejects mismatched thread IDs and unrelated or null-containing rollout pat
         state => { state.path = `/private/not-rollout-${ThreadId}.jsonl`; },
         state => { state.path = `/private/rollout-date-${ThreadId}.jsonl/other`; },
         state => { state.path = `/private\u0000/rollout-date-${ThreadId}.jsonl`; },
+        state => { state.path = `/home/user/.codex/sessions/../private/rollout-date-${ThreadId}.jsonl`; },
+        state => { state.path = `C:\\Users\\user\\.codex\\sessions\\..\\private\\rollout-date-${ThreadId}.jsonl`; },
+        state => { state.path = `C:\\Users\\user\\.codex\\sessions\\.. \\private\\rollout-date-${ThreadId}.jsonl`; },
+        state => { state.path = `C:\\Users\\user\\.codex\\sessions\\nested:stream\\rollout-date-${ThreadId}.jsonl`; },
+        state => { state.path = `relative/rollout-date-${ThreadId}.jsonl`; },
         state => { state.path = null; },
     ])
     {
@@ -402,11 +439,11 @@ test('rejects malformed base64 rather than silently accepting a decoded prefix',
     }
 });
 
-test('limits decoded files to 32 MiB', async t =>
+test('limits decoded files to 128 MiB', async t =>
 {
     const { store, identity } = fixture(t);
     const source = remote();
-    source.dataBase64 = Buffer.alloc(32 * 1024 * 1024 + 1).toString('base64');
+    source.dataBase64 = 'A'.repeat(Math.ceil((128 * 1024 * 1024 + 1) / 3) * 4);
     assert.equal((await store.getStats(identity, source.request)).status, 'unavailable');
 });
 
@@ -414,7 +451,7 @@ test('caches an oversized result until metadata changes and then recovers a smal
 {
     const { store, clock, identity } = fixture(t);
     const source = remote();
-    source.dataBase64 = Buffer.alloc(33 * 1024 * 1024).toString('base64');
+    source.dataBase64 = 'A'.repeat(Math.ceil((128 * 1024 * 1024 + 1) / 3) * 4);
     for (const time of [0, 15000, 30000, 45000, 60000])
     {
         clock.value = time;
@@ -423,7 +460,7 @@ test('caches an oversized result until metadata changes and then recovers a smal
         assert.equal(stats.totalTokens, null);
         assert.equal(source.calls.filter(call => call.method === 'fs/readFile').length, 1);
     }
-    assert.equal(source.calls.filter(call => call.method === 'fs/getMetadata').length, 2);
+    assert.equal(source.calls.filter(call => call.method === 'fs/getMetadata' && call.params.path === source.path).length, 2);
     source.dataBase64 = null;
     source.change(lines(usage('recovered', 3200)));
     clock.value = 120000;
@@ -439,7 +476,7 @@ test('an oversized replacement cannot revive an earlier successful snapshot', as
     const { store, clock, identity } = fixture(t);
     const source = remote();
     assert.equal((await store.getStats(identity, source.request)).totalTokens, 1200);
-    source.dataBase64 = Buffer.alloc(32 * 1024 * 1024 + 1).toString('base64');
+    source.dataBase64 = 'A'.repeat(Math.ceil((128 * 1024 * 1024 + 1) / 3) * 4);
     source.metadata.modifiedAtMs++;
     clock.value = 15000;
     assert.equal((await store.getStats(identity, source.request)).status, 'unavailable');
@@ -475,7 +512,7 @@ test('caches a bridge size-limit rejection until metadata changes and then recov
         assert.equal(stats.totalTokens, null);
         assert.equal(source.calls.filter(call => call.method === 'fs/readFile').length, 2);
     }
-    assert.equal(source.calls.filter(call => call.method === 'fs/getMetadata').length, 3);
+    assert.equal(source.calls.filter(call => call.method === 'fs/getMetadata' && call.params.path === source.path).length, 4);
     tooLarge = false;
     source.change(lines(usage('recovered', 3200)));
     clock.value = 135000;
@@ -503,7 +540,7 @@ test('lengthens polling for files larger than 4 MiB', async t =>
     source.change(lines(usage('second', 2200)));
     clock.value += 59999;
     assert.equal((await store.getStats(identity, source.request)).totalTokens, 1200);
-    assert.equal(source.calls.length, 3);
+    assert.equal(source.calls.filter(call => call.method === 'fs/readFile').length, 1);
     clock.value++;
     assert.equal((await store.getStats(identity, source.request)).totalTokens, 2200);
 });
@@ -519,5 +556,5 @@ test('evicts the least recently used idle host entry when its 32-session cache i
     sources[1].change(lines(usage('reloaded', 5200)));
     assert.equal((await store.getStats(identities[1], sources[1].request)).totalTokens, 5200);
     assert.equal((await store.getStats(identities[0], sources[0].request)).totalTokens, 1200);
-    assert.equal(sources[0].calls.length, 3);
+    assert.equal(sources[0].calls.filter(call => call.method === 'fs/readFile').length, 1);
 });

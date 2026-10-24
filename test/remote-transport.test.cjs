@@ -129,6 +129,37 @@ test("remote transport rejects write methods before executing page code", async 
     transport.dispose();
 });
 
+test("remote directory discovery uses only the native read-only path request", async t => {
+    const f = fixture(t, (envelope, emit) => {
+        assert.equal(envelope.request.method, "fs/readDirectory");
+        assert.equal(envelope.request.params.path, "/remote/sessions");
+        assert.deepEqual(Object.keys(envelope.request.params), ["path"]);
+        emit(response(envelope, { entries: [{ fileName: "2026", isDirectory: true, isFile: false }] }));
+    });
+    const result = await f.transport.request(f.frame, "host", "fs/readDirectory", { path: "/remote/sessions" });
+    assert.equal(result.entries[0].fileName, "2026");
+    assert.equal(f.listeners.size, 0);
+});
+
+test("default file requests allow bounded large histories with a longer read deadline", async t => {
+    const requests = [];
+    const f = fixture(t, (envelope, emit) => {
+        requests.push(envelope);
+        emit(response(envelope, {}));
+    }, { timeoutMs: undefined });
+    const scripts = [];
+    const frame = { executeJavaScript: source => {
+        scripts.push(source);
+        return f.frame.executeJavaScript(source);
+    } };
+    await f.transport.request(frame, "host", "fs/readFile", { path: "/remote/log" });
+    await f.transport.request(frame, "host", "fs/getMetadata", { path: "/remote/log" });
+    assert.ok(requests[0].timeoutMs > 110000 && requests[0].timeoutMs <= 120000);
+    assert.ok(requests[1].timeoutMs > 20000 && requests[1].timeoutMs <= 30000);
+    assert.match(scripts[0], /"maxChars":201326592/);
+    assert.match(scripts[1], /"maxChars":50331648/);
+});
+
 test("an expired page script cannot send a request after outer timeout and disable", async (t) => {
     let sends = 0;
     const f = fixture(t, () => { sends++; }, { timeoutMs: 10 });

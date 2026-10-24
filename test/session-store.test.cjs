@@ -65,6 +65,197 @@ function jsonLine(tokens, extra = {})
     return `${JSON.stringify({ tokens, ...extra })}\n`;
 }
 
+async function adapterFixture(t, { pathApi = path.posix, ...options } = {})
+{
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-session-adapter-'));
+    const codexHome = pathApi.join(pathApi === path.win32 ? 'C:\\remote' : '/remote', '.codex');
+    const files = new Map();
+    const candidates = [];
+    function localPath(filename)
+    {
+        if (!files.has(filename)) throw Object.assign(new Error('Unexpected source'), { code: 'ENOENT' });
+        return files.get(filename);
+    }
+    const store = createSessionStore({
+        codexHome,
+        createMetrics,
+        pathApi,
+        fileSystem: {
+            stat: filename => fs.stat(localPath(filename)),
+            open: (filename, flags) => fs.open(localPath(filename), flags),
+            opendir: async () => { throw new Error('Source adapter must bypass local indexing'); },
+        },
+        findSources: async threadId =>
+        {
+            assert.equal(threadId, ThreadId);
+            return candidates;
+        },
+        ...options,
+    });
+    t.after(async () =>
+    {
+        store.dispose();
+        await fs.rm(directory, { recursive: true });
+    });
+    return {
+        store,
+        candidates,
+        async write(relative, content)
+        {
+            const filename = pathApi.join(codexHome, ...relative.split('/'));
+            if (!files.has(filename)) files.set(filename, path.join(directory, `${files.size}.jsonl`));
+            await fs.writeFile(files.get(filename), content);
+            candidates.push(filename);
+            return filename;
+        },
+        append: (filename, content) => fs.appendFile(localPath(filename), content),
+    };
+}
+
+function sessionMeta(extra = {}, ordinal)
+{
+    return jsonLine(0, { type: 'session_meta', payload: { id: ThreadId, ...extra },
+        ...(ordinal === undefined ? {} : { ordinal }) });
+}
+
+for (const [platform, pathApi] of [['POSIX', path.posix], ['Windows', path.win32]])
+{
+    test(`source adapters use ${platform} paths and prefer the active copy of an archived rollout`, async t =>
+    {
+        const f = await adapterFixture(t, { pathApi });
+        const name = `rollout-2026-10-22T10-00-00-${ThreadId}.jsonl`;
+        await f.write(`archived_sessions/${name}`, jsonLine(900));
+        const active = await f.write(`sessions/2026/10/22/${name}`, jsonLine(14));
+        await f.write(`sessions/rollout-2026-10-23T10-00-00-${OtherThreadId}.jsonl`, jsonLine(1000));
+        await f.write(`sessions/private-${ThreadId}.jsonl`, jsonLine(2000));
+
+        const initial = await f.store.getStats(ThreadId.toUpperCase());
+        assert.equal(initial.status, 'ok');
+        assert.equal(initial.totalTokens, 14);
+        await f.append(active, jsonLine(6));
+        assert.equal((await f.store.getStats(ThreadId)).totalTokens, 20);
+    });
+}
+
+test('source adapters reject filenames for another session before opening them', async t =>
+{
+    const f = await adapterFixture(t);
+    await f.write(`sessions/rollout-2026-10-22T10-00-00-${OtherThreadId}.jsonl`, jsonLine(99));
+    await f.write(`sessions/private-${ThreadId}.jsonl`, jsonLine(99));
+    const stats = await f.store.getStats(ThreadId);
+    assert.equal(stats.status, 'not-found');
+    assert.equal(stats.totalTokens, 0);
+});
+
+test('source adapters reject mismatched rollout metadata', async t =>
+{
+    const f = await adapterFixture(t);
+    await f.write(`sessions/rollout-2026-10-22T10-00-00-${ThreadId}.jsonl`,
+        sessionMeta({ id: OtherThreadId }) + jsonLine(99));
+    const stats = await f.store.getStats(ThreadId);
+    assert.equal(stats.status, 'unavailable');
+    assert.equal(stats.totalTokens, 0);
+});
+
+test('source adapters retain exact continuation byte and ordinal boundaries after sorting candidates', async t =>
+{
+    const f = await adapterFixture(t);
+    const prefix = sessionMeta({}, 0) + jsonLine(10);
+    const original = `rollout-2026-10-22T10-00-00-${ThreadId}.jsonl`;
+    const latest = `rollout-2026-10-23T10-00-00-${ThreadId}_${OtherThreadId}.jsonl`;
+    await f.write(`sessions/${latest}`, sessionMeta({ history_base: {
+        thread_id: ThreadId, end_byte_offset: Buffer.byteLength(prefix), end_ordinal_exclusive: 2,
+    } }, 2) + jsonLine(20));
+    await f.write(`sessions/${original}`, prefix + jsonLine(1000));
+    const stats = await f.store.getStats(ThreadId);
+    assert.equal(stats.status, 'ok');
+    assert.equal(stats.totalTokens, 30);
+    assert.equal(stats.steps, 4);
+});
+
+test('source adapters fail closed when the requested history ordinal does not match its bytes', async t =>
+{
+    const f = await adapterFixture(t);
+    const prefix = sessionMeta({}, 0) + jsonLine(10);
+    await f.write(`sessions/rollout-2026-10-22T10-00-00-${ThreadId}.jsonl`, prefix);
+    await f.write(`sessions/rollout-2026-10-23T10-00-00-${ThreadId}_${OtherThreadId}.jsonl`,
+        sessionMeta({ history_base: {
+            thread_id: ThreadId, end_byte_offset: Buffer.byteLength(prefix), end_ordinal_exclusive: 3,
+        } }, 3) + jsonLine(20));
+    const stats = await f.store.getStats(ThreadId);
+    assert.equal(stats.status, 'unavailable');
+    assert.equal(stats.totalTokens, 0);
+});
+
+test('source adapters stop at valid fork boundaries without reading parent history', async t =>
+{
+    const f = await adapterFixture(t);
+    await f.write(`sessions/rollout-2026-10-22T10-00-00-${ThreadId}.jsonl`,
+        sessionMeta({ forked_from_id: OtherThreadId, forked_from_ordinal_exclusive: 10,
+            history_base: { thread_id: OtherThreadId, end_byte_offset: 123456, end_ordinal_exclusive: 10 } }, 10)
+        + jsonLine(30));
+    const stats = await f.store.getStats(ThreadId);
+    assert.equal(stats.status, 'ok');
+    assert.equal(stats.totalTokens, 30);
+});
+
+test('source adapters enforce the shared maximum source count', async t =>
+{
+    const f = await adapterFixture(t);
+    for (let i = 0; i < 33; i++)
+    {
+        await f.write(`sessions/rollout-2026-10-22T10-00-${String(i).padStart(2, '0')}-${ThreadId}.jsonl`, jsonLine(1));
+    }
+    const stats = await f.store.getStats(ThreadId);
+    assert.equal(stats.status, 'unavailable');
+    assert.equal(stats.totalTokens, 0);
+});
+
+for (const failure of ['return false', 'throw'])
+{
+    test(`record validation can ${failure} for later metadata without exposing partial totals`, async t =>
+    {
+        let rejected = true;
+        const f = await adapterFixture(t, { validateRecord: record =>
+        {
+            if (rejected && record.type === 'session_meta' && record.payload.id !== ThreadId)
+            {
+                if (failure === 'throw') throw new Error('Mismatched identity');
+                return false;
+            }
+        } });
+        await f.write(`sessions/rollout-2026-10-22T10-00-00-${ThreadId}.jsonl`,
+            sessionMeta() + jsonLine(10) + sessionMeta({ id: OtherThreadId }) + jsonLine(20));
+        const failed = await f.store.getStats(ThreadId);
+        assert.equal(failed.status, 'unavailable');
+        assert.equal(failed.totalTokens, 0);
+        assert.equal(failed.steps, 0);
+        rejected = false;
+        const recovered = await f.store.getStats(ThreadId);
+        assert.equal(recovered.status, 'ok');
+        assert.equal(recovered.totalTokens, 30);
+        assert.equal(recovered.steps, 4);
+    });
+}
+
+test('record validation can reject an ordinary record before metrics ingestion', async t =>
+{
+    const { codexHome } = await fixture(t);
+    const ingested = [];
+    const store = createSessionStore({ codexHome, createMetrics: () =>
+    {
+        const metrics = createMetrics();
+        return { ...metrics, ingest(record) { ingested.push(record.tokens); metrics.ingest(record); } };
+    },
+        validateRecord: record => record.tokens !== 99 });
+    t.after(() => store.dispose());
+    await writeSession(codexHome, ThreadId, jsonLine(10) + jsonLine(99));
+    const stats = await store.getStats(ThreadId);
+    assert.equal(stats.status, 'unavailable');
+    assert.equal(stats.totalTokens, 0);
+    assert.deepEqual(ingested, [10]);
+});
+
 test('rejects path-shaped and nonstandard thread identifiers without throwing', async t =>
 {
     const { store } = await fixture(t);
