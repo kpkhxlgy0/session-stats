@@ -51,7 +51,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.4.0](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.4.0)。
+版本：[v0.4.1](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.4.1)。
 
 ## 本地 Inject / Uninject
 
@@ -97,7 +97,11 @@ npm run install:local
   支持续接日志、归档和分叉，按 `history_base` 的字节/记录数边界还原有效历史，排除废弃尾部。
   fork 的 TPS 会追溯声明的父会话前缀，父历史不会混入当前分支的其他计数。计时与用量匹配、响应去重和跨轮累计平均公式保持一致。
 - 运行端也可读取 `.jsonl.zst` 压缩历史，只解码所需前缀，不把解压后的聊天内容写入磁盘。
-  解压数据缓存和已打开的数据合计最多 256 MiB、64 个缓存项，每次最多读取 64 MiB 压缩输入；原生 Zstd 不可用或超出限制时，相关 TPS 保持未知。
+  压缩历史按最多 64 KiB 的输入/输出块流式解压，消费完成后才继续读取；每个统计器串行解压，
+  原生 Zstd 窗口上限为 128 MiB。不缓存解压日志，不再因文件超过 64 MiB 或解压前缀超过 256 MiB 而拒绝读取。
+  只保留统计累加器及最多 1024 项元数据、1024 项边界校验结果；单条日志仍限制为 8 MiB。
+  文件版本未变化时复用已有统计，重复刷新不会重新解压父历史；文件变化后重新校验并重建，避免混用或重复计算。
+  原生 Zstd 不可用、窗口超限、必要历史损坏或无法确认边界时，相关 TPS 保持未知。
   同一日志同时存在普通和压缩副本时优先读取普通副本；远程接收端仍然只读取统计快照。
 - 快照位于 `$CODEX_HOME/.session-stats/<会话 UUID>.json`，只包含统计值、会话/发布者标识、递增版本及更新时间，
   不包含聊天正文、原始日志路径或认证信息；每份最多 16 KiB。本地底栏返回同一次成功发布的样本。

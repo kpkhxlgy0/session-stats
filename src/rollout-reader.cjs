@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const zlib = require('node:zlib');
 
 const ChunkBytes = 64 * 1024;
-const MaxCacheEntries = 64;
+const MinOutputChunkBytes = 4096;
 
 function readerError(code, message)
 {
@@ -15,16 +15,6 @@ function version(stat)
 {
     return ['dev', 'ino', 'size', 'birthtimeMs', 'mtimeMs', 'ctimeMs',
         'birthtimeNs', 'mtimeNs', 'ctimeNs'].map(key => String(stat[key])).join(':');
-}
-
-function logicalStat(stat, size)
-{
-    const result = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { size });
-    for (const key of ['birthtime', 'mtime', 'ctime', 'atime'])
-    {
-        if (stat[key] instanceof Date) result[key] = new Date(stat[key]);
-    }
-    return result;
 }
 
 // Node 22's native Zstd stream can end successfully inside an incomplete frame.
@@ -130,163 +120,142 @@ function frameBoundary()
     };
 }
 
-function createRolloutReader({ fileSystem = fs, maxBytes = 256 * 1024 * 1024,
-    maxCompressedBytes = 64 * 1024 * 1024 } = {})
+function createRolloutReader({ fileSystem = fs, inputChunkBytes = ChunkBytes,
+    outputChunkBytes = ChunkBytes } = {})
 {
-    for (const value of [maxBytes, maxCompressedBytes])
+    if (!Number.isSafeInteger(inputChunkBytes) || inputChunkBytes < 1 || inputChunkBytes > ChunkBytes
+        || !Number.isSafeInteger(outputChunkBytes) || outputChunkBytes < MinOutputChunkBytes
+        || outputChunkBytes > ChunkBytes)
     {
-        if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('Invalid rollout resource limit');
+        throw new RangeError('Invalid rollout buffer limit');
     }
-    const cache = new Map();
-    const handles = new Set();
-    let retainedBytes = 0;
     let pending = Promise.resolve();
-    let cancelDecode;
+    let cancelActive;
     let disposed = false;
 
     const disposedError = () => readerError('ERR_ROLLOUT_DISPOSED', 'Rollout reader is disposed');
-    const changedError = () => readerError('ERR_ROLLOUT_CHANGED', 'Compressed rollout changed while reading');
-    const limitError = () => readerError('ERR_ROLLOUT_RESOURCE_LIMIT', 'Compressed rollout exceeds the resource limit');
+    const changedError = () => readerError('ERR_ROLLOUT_CHANGED', 'Rollout changed while reading');
 
-    function remove(entry)
+    async function decode(input, limit, onChunk)
     {
-        if (!cache.delete(entry)) return;
-        retainedBytes -= entry.size;
-        entry.chunks = [];
-    }
-
-    function reserve(entry)
-    {
-        for (const candidate of cache.keys())
-        {
-            if (cache.size < MaxCacheEntries) break;
-            if (!candidate.pins) remove(candidate);
-        }
-        if (cache.size >= MaxCacheEntries) throw limitError();
-        // Keep the decoding entry pinned until it can be handed to its caller.
-        entry.pins = 1;
-        cache.set(entry, entry);
-    }
-
-    function invalidate(entry)
-    {
-        entry.invalid = true;
-        if (!entry.pins && cache.has(entry)) remove(entry);
-    }
-
-    function append(entry, chunk, length)
-    {
-        for (const candidate of cache.keys())
-        {
-            if (retainedBytes + length <= maxBytes) break;
-            if (!candidate.pins) remove(candidate);
-        }
-        if (retainedBytes + length > maxBytes) throw limitError();
-        // Native chunks can be short views into a much larger output buffer.
-        // Every retained backing allocation must match the charged byte count.
-        let buffer = chunk;
-        if (length !== chunk.length || chunk.byteOffset !== 0 || chunk.buffer.byteLength !== length)
-        {
-            buffer = Buffer.allocUnsafeSlow(length);
-            chunk.copy(buffer, 0, 0, length);
-        }
-        entry.chunks.push({ buffer, start: entry.size });
-        entry.size += length;
-        retainedBytes += length;
-    }
-
-    async function decode(input, entry, limit)
-    {
-        if (limit === 0) return;
-        const windowParameter = zlib.constants && zlib.constants.ZSTD_d_windowLogMax;
-        const decoder = zlib.createZstdDecompress({ chunkSize: ChunkBytes,
-            params: { [windowParameter]: 27 } });
+        if (limit === 0) return 0;
+        const decoder = zlib.createZstdDecompress({ chunkSize: outputChunkBytes,
+            readableHighWaterMark: outputChunkBytes, writableHighWaterMark: inputChunkBytes,
+            params: { [zlib.constants.ZSTD_d_windowLogMax]: 27 } });
         const framing = frameBoundary();
-        let satisfied = false;
-        let failure;
+        let bytesRead = 0;
+        let stopped = false;
+        let settled = false;
+        let delivery;
         let resolveDone;
         let rejectDone;
-        const done = new Promise((resolve, reject) =>
+        let cancelWait;
+        const done = new Promise((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
+
+        function stop()
         {
-            resolveDone = resolve;
-            rejectDone = reject;
-        });
-        function fail(error)
-        {
-            if (satisfied || failure) return;
-            failure = error;
-            rejectDone(error);
+            stopped = true;
+            if (cancelWait) cancelWait();
             decoder.destroy();
         }
-        cancelDecode = () => fail(disposedError());
-        decoder.on('error', fail);
-        decoder.on('data', chunk =>
+        async function waitFor(operation)
         {
-            if (satisfied || failure) return;
             try
             {
-                const length = limit === null ? chunk.length : Math.min(chunk.length, limit - entry.size);
-                append(entry, chunk, length);
-                if (limit !== null && entry.size === limit)
+                await new Promise((resolve, reject) =>
                 {
-                    satisfied = true;
-                    resolveDone();
-                    decoder.destroy();
-                }
+                    cancelWait = resolve;
+                    operation.then(resolve, reject);
+                    if (stopped) resolve();
+                });
             }
-            catch (error)
+            finally
             {
-                fail(error);
+                cancelWait = null;
             }
+        }
+        function fail(error)
+        {
+            if (settled) return;
+            settled = true;
+            stop();
+            rejectDone(error);
+        }
+        function succeed()
+        {
+            if (settled) return;
+            settled = true;
+            stop();
+            resolveDone(bytesRead);
+        }
+        cancelActive = () => fail(disposedError());
+        decoder.on('error', error => { if (!stopped) fail(error); });
+        decoder.on('data', chunk =>
+        {
+            if (stopped) return;
+            // Pause synchronously: one native input chunk may expand into many output chunks.
+            decoder.pause();
+            const length = limit === null ? chunk.length : Math.min(chunk.length, limit - bytesRead);
+            bytesRead += length;
+            const satisfied = limit !== null && bytesRead === limit;
+            // Stop native decoding before awaiting a consumer of the final requested prefix.
+            if (satisfied) stop();
+            delivery = (async () =>
+            {
+                const keepReading = await onChunk(chunk.subarray(0, length));
+                if (settled) return;
+                if (disposed) throw disposedError();
+                if (satisfied || keepReading === false) succeed();
+                else
+                {
+                    delivery = null;
+                    decoder.resume();
+                }
+            })().catch(fail);
         });
         decoder.once('end', () =>
         {
             if (!framing.complete())
             {
                 fail(readerError('ERR_ROLLOUT_ZSTD_TRUNCATED', 'Compressed rollout has an incomplete Zstd frame'));
-                return;
             }
-            entry.complete = true;
-            resolveDone();
+            else succeed();
         });
         const pumping = (async () =>
         {
             let position = 0;
             let resetFrame = false;
-            while (!satisfied && !failure)
+            while (!stopped)
             {
+                const buffer = Buffer.allocUnsafeSlow(inputChunkBytes);
+                const result = await input.read(buffer, 0, buffer.length, position);
                 if (disposed) throw disposedError();
-                if (position >= maxCompressedBytes)
-                {
-                    if (position < entry.physical.size) throw limitError();
-                    decoder.end();
-                    return;
-                }
-                const buffer = Buffer.allocUnsafeSlow(Math.min(ChunkBytes, maxCompressedBytes - position));
-                const { bytesRead } = await input.read(buffer, 0, buffer.length, position);
-                if (disposed) throw disposedError();
-                if (!bytesRead)
+                if (stopped) return;
+                if (!result.bytesRead)
                 {
                     decoder.end();
                     return;
                 }
-                position += bytesRead;
-                const ends = framing.ingest(buffer.subarray(0, bytesRead));
+                position += result.bytesRead;
+                const ends = framing.ingest(buffer.subarray(0, result.bytesRead));
                 const frames = ends.length;
-                if (ends[ends.length - 1] !== bytesRead) ends.push(bytesRead);
+                if (ends[ends.length - 1] !== result.bytesRead) ends.push(result.bytesRead);
                 let from = 0;
-                for (let i = 0; i < ends.length && !satisfied && !failure; i++)
+                for (let i = 0; i < ends.length && !stopped; i++)
                 {
                     // Node 22 stops at its first frame. Feed complete frame boundaries
                     // separately and reset the native context before the next frame.
                     if (resetFrame) decoder.reset();
                     // Native Zstd can emit an error without invoking the write callback.
-                    await Promise.race([done, new Promise((resolve, reject) =>
+                    await waitFor(new Promise((resolve, reject) =>
                         decoder.write(buffer.subarray(from, ends[i]), error =>
                         {
                             if (error) reject(error);
                             else resolve();
-                        }))]);
+                        })));
+                    // A native write callback can run while its output consumer is paused.
+                    // Do not read another input chunk or frame until that consumer finishes.
+                    while (delivery && !stopped) await waitFor(delivery);
                     from = ends[i];
                     resetFrame = i < frames;
                 }
@@ -294,174 +263,117 @@ function createRolloutReader({ fileSystem = fs, maxBytes = 256 * 1024 * 1024,
         })().catch(fail);
         try
         {
-            await done;
+            return await done;
         }
         finally
         {
-            decoder.destroy();
+            stop();
             await pumping;
-            cancelDecode = null;
+            cancelActive = null;
         }
     }
 
-    function cachedHandle(entry, limit)
+    async function scanPlain(input, limit, onChunk)
     {
-        const size = limit === null ? entry.size : Math.min(limit, entry.size);
-        let closed = false;
-        let position = 0;
-        entry.pins++;
-        cache.delete(entry);
-        cache.set(entry, entry);
-        function check()
+        let bytesRead = 0;
+        let rejectConsumer;
+        cancelActive = () => { if (rejectConsumer) rejectConsumer(disposedError()); };
+        try
         {
-            if (closed) throw readerError('EBADF', 'Rollout handle is closed');
-            if (entry.invalid) throw changedError();
+            while (limit === null || bytesRead < limit)
+            {
+                const length = limit === null ? inputChunkBytes : Math.min(inputChunkBytes, limit - bytesRead);
+                const buffer = Buffer.allocUnsafeSlow(length);
+                const result = await input.read(buffer, 0, length, bytesRead);
+                if (disposed) throw disposedError();
+                if (!result.bytesRead) break;
+                bytesRead += result.bytesRead;
+                const keepReading = await new Promise((resolve, reject) =>
+                {
+                    rejectConsumer = reject;
+                    Promise.resolve(onChunk(buffer.subarray(0, result.bytesRead))).then(resolve, reject);
+                });
+                rejectConsumer = null;
+                if (keepReading === false) break;
+            }
+            return bytesRead;
         }
-        function close()
+        finally
         {
-            if (closed) return;
-            closed = true;
-            handles.delete(close);
-            entry.pins--;
-            if (!entry.pins && (disposed || entry.invalid)) remove(entry);
+            cancelActive = null;
         }
-        handles.add(close);
-        return {
-            async read(buffer, offset = 0, length = buffer.byteLength - offset, at = null)
-            {
-                check();
-                if (!ArrayBuffer.isView(buffer)) throw new TypeError('Rollout read requires a buffer');
-                if (![offset, length].every(value => Number.isSafeInteger(value) && value >= 0)
-                    || offset + length > buffer.byteLength) throw new RangeError('Invalid rollout read range');
-                const start = at === null ? position : at;
-                if (!Number.isSafeInteger(start) || start < 0) throw new RangeError('Invalid rollout read position');
-                const bytesRead = Math.min(length, Math.max(0, size - start));
-                const target = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-                let copied = 0;
-                for (const chunk of entry.chunks)
-                {
-                    if (copied === bytesRead) break;
-                    const from = Math.max(0, start + copied - chunk.start);
-                    if (from >= chunk.buffer.length) continue;
-                    const count = Math.min(bytesRead - copied, chunk.buffer.length - from);
-                    chunk.buffer.copy(target, offset + copied, from, from + count);
-                    copied += count;
-                }
-                if (at === null) position += bytesRead;
-                return { bytesRead, buffer };
-            },
-            async stat()
-            {
-                check();
-                const current = await fileSystem.stat(entry.filename);
-                check();
-                if (version(current) !== entry.version)
-                {
-                    invalidate(entry);
-                    throw changedError();
-                }
-                return logicalStat(entry.physical, size);
-            },
-            async close() { close(); },
-        };
     }
 
-    async function openCompressed(filename, limit)
+    async function scanFile(filename, limit, onChunk)
     {
         if (disposed) throw disposedError();
-        if (typeof zlib.createZstdDecompress !== 'function'
-            || !Number.isInteger(zlib.constants && zlib.constants.ZSTD_d_windowLogMax))
+        const compressed = /\.zst$/i.test(filename);
+        if (compressed && (typeof zlib.createZstdDecompress !== 'function'
+            || !Number.isInteger(zlib.constants && zlib.constants.ZSTD_d_windowLogMax)))
         {
             throw readerError('ERR_ROLLOUT_ZSTD_UNAVAILABLE',
                 'Compressed rollouts require native Node.js Zstd decompression with a bounded window');
         }
-        if (limit !== null && limit > maxBytes) throw limitError();
         const input = await fileSystem.open(filename, 'r');
-        let entry;
-        let decoded = false;
-        function discardDecoded()
-        {
-            if (!decoded) return;
-            entry.pins = 0;
-            remove(entry);
-            decoded = false;
-        }
         try
         {
-            const physical = await input.stat();
-            const physicalVersion = version(physical);
-            if (version(await fileSystem.stat(filename)) !== physicalVersion) throw changedError();
-            if (disposed) throw disposedError();
-            for (const candidate of cache.keys())
+            const stat = await input.stat();
+            const originalVersion = version(stat);
+            async function checkVersion()
             {
-                if (candidate.filename !== filename) continue;
-                if (candidate.version !== physicalVersion) invalidate(candidate);
-                else if (!candidate.invalid && (candidate.complete || limit !== null && candidate.size >= limit))
+                let current;
+                try
                 {
-                    entry = candidate;
+                    current = await fileSystem.stat(filename);
                 }
+                catch (error)
+                {
+                    if (error.code === 'ENOENT') throw changedError();
+                    throw error;
+                }
+                if (version(current) !== originalVersion || version(await input.stat()) !== originalVersion)
+                {
+                    throw changedError();
+                }
+                if (disposed) throw disposedError();
             }
-            if (!entry)
-            {
-                entry = { filename, physical, version: physicalVersion, chunks: [], size: 0,
-                    pins: 0, complete: false, invalid: false };
-                reserve(entry);
-                decoded = true;
-                await decode(input, entry, limit);
-            }
-            if (disposed) throw disposedError();
-            const [after, current] = await Promise.all([input.stat(), fileSystem.stat(filename)]);
-            if (version(after) !== physicalVersion || version(current) !== physicalVersion) throw changedError();
-            if (disposed) throw disposedError();
-        }
-        catch (error)
-        {
-            discardDecoded();
-            throw error;
-        }
-        finally
-        {
+            await checkVersion();
+            let bytesRead;
             try
             {
-                await input.close();
+                bytesRead = await (compressed ? decode(input, limit, onChunk) : scanPlain(input, limit, onChunk));
             }
             catch (error)
             {
-                discardDecoded();
+                await checkVersion();
                 throw error;
             }
+            await checkVersion();
+            return { bytesRead, stat };
         }
-        if (disposed)
+        finally
         {
-            discardDecoded();
-            throw disposedError();
+            await input.close();
         }
-        if (decoded) entry.pins--;
-        return cachedHandle(entry, limit);
     }
 
     return {
-        async open(filename, { limit = null } = {})
+        async scan(filename, { limit = null, onChunk } = {})
         {
             if (disposed) throw disposedError();
-            if (!/\.zst$/i.test(filename)) return fileSystem.open(filename, 'r');
             if (limit !== null && (!Number.isSafeInteger(limit) || limit < 0))
             {
                 throw new RangeError('Invalid decoded rollout prefix limit');
             }
-            const operation = pending.then(() => openCompressed(filename, limit));
+            if (typeof onChunk !== 'function') throw new TypeError('Rollout scan requires an onChunk callback');
+            const operation = pending.then(() => scanFile(filename, limit, onChunk));
             pending = operation.catch(() => {});
             return operation;
         },
         dispose()
         {
             disposed = true;
-            if (cancelDecode) cancelDecode();
-            for (const close of handles) close();
-            for (const entry of cache.keys())
-            {
-                if (!entry.pins) remove(entry);
-            }
+            if (cancelActive) cancelActive();
             return pending;
         },
     };

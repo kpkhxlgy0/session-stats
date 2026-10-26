@@ -16,6 +16,7 @@ const IndexRefreshMs = 15000;
 const ChunkBytes = 64 * 1024;
 const MaxLineBytes = 8 * 1024 * 1024;
 const GuardBytes = 256;
+const MaxValidationEntries = MaxSessions * MaxSources;
 const EmptyStats = Object.freeze({
     turns: 0,
     steps: 0,
@@ -43,6 +44,23 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
     let indexAt = -Infinity;
     let indexPending;
     let disposed = false;
+    const metadataCache = new Map();
+    const boundaryCache = new Map();
+
+    function remember(cache, key, value)
+    {
+        cache.delete(key);
+        if (cache.size >= MaxValidationEntries) cache.delete(cache.keys().next().value);
+        cache.set(key, value);
+        return value;
+    }
+
+    function fileVersion(stat)
+    {
+        return sourceIdentity(stat, true);
+    }
+
+    function compressed(filename) { return /\.zst$/i.test(filename); }
 
     function result(threadId, status, entry)
     {
@@ -231,43 +249,104 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
 
     async function metadata(filename, threadId, limit = MaxLineBytes)
     {
-        const handle = await reader.open(filename, { limit });
-        try
+        const isCompressed = compressed(filename);
+        let version;
+        if (isCompressed)
         {
-            const chunks = [];
-            let offset = 0;
-            while (offset < MaxLineBytes)
-            {
-                const buffer = Buffer.alloc(Math.min(ChunkBytes, MaxLineBytes - offset));
-                const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
-                if (!bytesRead) break;
-                const newline = buffer.subarray(0, bytesRead).indexOf(10);
-                chunks.push(buffer.subarray(0, newline === -1 ? bytesRead : newline));
-                offset += bytesRead;
-                if (newline === -1) continue;
-                let record;
-                try { record = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-                catch { break; }
-                if (record?.type !== 'session_meta') break;
-                const meta = record.payload;
-                if (typeof meta?.id !== 'string' || meta.id.toLowerCase() !== threadId
-                    || meta.session_id !== undefined && meta.session_id?.toLowerCase?.() !== threadId)
-                {
-                    throw new Error('Mismatched rollout identity');
-                }
-                if (record.ordinal !== undefined && (!Number.isSafeInteger(record.ordinal) || record.ordinal < 0))
-                    throw new Error('Invalid rollout ordinal');
-                return { payload: meta, startOrdinal: record.ordinal ?? 0, hasOrdinal: record.ordinal !== undefined };
-            }
-            if (SessionPattern.exec(pathApi.basename(filename))[3]) throw new Error('Missing continuation metadata');
-            return { payload: {}, startOrdinal: 0, hasOrdinal: false };
+            version = fileVersion(await fileSystem.stat(filename));
+            const cached = metadataCache.get(filename);
+            if (cached?.version === version && cached.threadId === threadId && cached.limit <= limit)
+                return cached.head;
         }
-        finally { await handle.close(); }
+        const chunks = [];
+        let lineBytes = 0;
+        let complete = false;
+        function accept(chunk)
+        {
+            const newline = chunk.indexOf(10);
+            const part = chunk.subarray(0, newline === -1 ? chunk.length : newline);
+            chunks.push(part);
+            lineBytes += part.length;
+            complete = newline !== -1;
+            return !complete;
+        }
+        if (isCompressed)
+        {
+            const scanned = await reader.scan(filename, { limit: Math.min(limit, MaxLineBytes), onChunk: accept });
+            if (fileVersion(scanned.stat) !== version) throw new Error('Rollout metadata changed');
+        }
+        else
+        {
+            const handle = await fileSystem.open(filename, 'r');
+            try
+            {
+                while (lineBytes < MaxLineBytes && !complete)
+                {
+                    const buffer = Buffer.alloc(Math.min(ChunkBytes, MaxLineBytes - lineBytes));
+                    const { bytesRead } = await handle.read(buffer, 0, buffer.length, lineBytes);
+                    if (!bytesRead) break;
+                    accept(buffer.subarray(0, bytesRead));
+                }
+            }
+            finally { await handle.close(); }
+        }
+        let record;
+        if (complete)
+        {
+            try { record = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+            catch { /* 普通旧日志可以没有元数据，续接文件仍须验证。 */ }
+        }
+        let head = { payload: {}, startOrdinal: 0, hasOrdinal: false };
+        if (record?.type === 'session_meta')
+        {
+            const meta = record.payload;
+            if (typeof meta?.id !== 'string' || meta.id.toLowerCase() !== threadId
+                || meta.session_id !== undefined && meta.session_id?.toLowerCase?.() !== threadId)
+                throw new Error('Mismatched rollout identity');
+            if (record.ordinal !== undefined && (!Number.isSafeInteger(record.ordinal) || record.ordinal < 0))
+                throw new Error('Invalid rollout ordinal');
+            // 只保留解析链所需的标量，不能把元数据中的指令/聊天内容放进缓存。
+            const uuid = value => typeof value === 'string' && UuidPattern.test(value) ? value : undefined;
+            const integer = value => Number.isSafeInteger(value) ? value : undefined;
+            const boundary = meta.history_base;
+            head = { payload: { id: meta.id, session_id: meta.session_id,
+                forked_from_id: uuid(meta.forked_from_id),
+                forked_from_ordinal_exclusive: integer(meta.forked_from_ordinal_exclusive),
+                history_base: boundary === undefined || boundary === null ? boundary : {
+                    thread_id: uuid(boundary.thread_id), end_byte_offset: integer(boundary.end_byte_offset),
+                    end_ordinal_exclusive: integer(boundary.end_ordinal_exclusive),
+                } }, startOrdinal: record.ordinal ?? 0, hasOrdinal: record.ordinal !== undefined };
+        }
+        else if (SessionPattern.exec(pathApi.basename(filename))[3]) throw new Error('Missing continuation metadata');
+        if (isCompressed && complete)
+            remember(metadataCache, filename, { version, threadId, head, limit: lineBytes + 1 });
+        return head;
     }
 
     async function matchesBoundary(filename, boundary, startOrdinal)
     {
-        const handle = await reader.open(filename, { limit: boundary.end_byte_offset });
+        if (compressed(filename))
+        {
+            const key = JSON.stringify([filename, boundary.end_byte_offset, boundary.end_ordinal_exclusive, startOrdinal]);
+            const version = fileVersion(await fileSystem.stat(filename));
+            const cached = boundaryCache.get(key);
+            if (cached?.version === version) return cached.matches;
+            let lines = 0;
+            let lastByte;
+            const scanned = await reader.scan(filename, { limit: boundary.end_byte_offset, onChunk(chunk)
+            {
+                for (let i = 0; i < chunk.length; i++) if (chunk[i] === 10) lines++;
+                lastByte = chunk[chunk.length - 1];
+                return lines <= boundary.end_ordinal_exclusive - startOrdinal;
+            } });
+            if (fileVersion(scanned.stat) !== version) throw new Error('Rollout boundary changed');
+            const matches = scanned.bytesRead === boundary.end_byte_offset
+                && (boundary.end_byte_offset === 0 || lastByte === 10)
+                && lines === boundary.end_ordinal_exclusive - startOrdinal;
+            remember(boundaryCache, key, { version, matches });
+            return matches;
+        }
+        const handle = await fileSystem.open(filename, 'r');
         try
         {
             if ((await handle.stat()).size < boundary.end_byte_offset) return false;
@@ -489,7 +568,7 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
     function sourceIdentity(stat, inherited = false)
     {
         return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`
-            + (inherited ? `:${stat.mtimeMs}:${stat.ctimeMs}` : '');
+            + (inherited ? `:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}` : '');
     }
 
     async function verifyInherited(files)
@@ -515,19 +594,20 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
             let changed = false;
             for (const source of sources)
             {
-                const handle = await reader.open(source.path, { limit: source.limit });
+                const isCompressed = compressed(source.path);
+                const handle = isCompressed ? null : await fileSystem.open(source.path, 'r');
                 files.push({ handle, path: source.path });
-                const stat = await handle.stat();
-                if (!stat.isFile() || source.limit !== null && stat.size < source.limit)
+                const stat = handle ? await handle.stat() : await fileSystem.stat(source.path);
+                if (!stat.isFile() || !isCompressed && source.limit !== null && stat.size < source.limit)
                 {
                     throw new Error('Invalid session file');
                 }
-                const identity = sourceIdentity(stat, inherited);
-                const size = source.limit ?? stat.size;
+                const identity = sourceIdentity(stat, inherited || isCompressed);
+                const size = isCompressed ? source.limit : source.limit ?? stat.size;
                 Object.assign(files[files.length - 1], { size, identity });
-                if (source.identity !== null && (source.identity !== identity || size < source.offset
-                    || !await matchesGuard(handle, source.head, 0)
-                    || !await matchesGuard(handle, source.tail, source.offset - source.tail.length))) changed = true;
+                if (source.identity !== null && (source.identity !== identity || !isCompressed
+                    && (size < source.offset || !await matchesGuard(handle, source.head, 0)
+                        || !await matchesGuard(handle, source.tail, source.offset - source.tail.length)))) changed = true;
             }
             if (changed)
             {
@@ -536,8 +616,33 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
             for (let i = 0; i < files.length; i++)
             {
                 const { handle, size, identity } = files[i];
-                sources[i].identity = identity;
-                await readSource(sources[i], handle, size, metrics, inherited);
+                const source = sources[i];
+                source.identity = identity;
+                if (handle) await readSource(source, handle, size, metrics, inherited);
+                else if (!source.finished)
+                {
+                    try
+                    {
+                        const scanned = await reader.scan(source.path, { limit: source.limit, onChunk(chunk)
+                        {
+                            source.offset += chunk.length;
+                            consume(source, chunk, metrics, inherited);
+                        } });
+                        if (sourceIdentity(scanned.stat, true) !== identity)
+                            throw Object.assign(new Error('Compressed rollout changed'), { sourcesChanged: true });
+                        if (source.limit !== null && (scanned.bytesRead !== source.limit
+                            || source.lines !== source.ordinal || source.pending.length || source.skippingLine))
+                            throw new Error('History boundary changed');
+                        source.finished = true;
+                        // 压缩文件发生变化时会整体重建，不保留最后一行的原始文本。
+                        source.pending = Buffer.alloc(0);
+                    }
+                    catch (error)
+                    {
+                        if (error.code === 'ERR_ROLLOUT_CHANGED') error.sourcesChanged = true;
+                        throw error;
+                    }
+                }
             }
             if (inherited)
             {
@@ -547,7 +652,7 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
         }
         finally
         {
-            await Promise.all(files.map(file => file.handle.close()));
+            await Promise.all(files.map(file => file.handle?.close()));
         }
     }
 
@@ -698,6 +803,8 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
         reader.dispose();
         sessions.clear();
         index.clear();
+        metadataCache.clear();
+        boundaryCache.clear();
     }
 
     return { getStats, dispose };
