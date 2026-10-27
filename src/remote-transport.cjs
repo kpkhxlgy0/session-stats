@@ -300,20 +300,18 @@ function createRemoteTransport({ timeoutMs, maxChars } = {}) {
             }
             return directory ? String(info.createdAtMs) : `${info.createdAtMs}:${info.modifiedAtMs}`;
         };
-        const directoryKeys = [];
-        for (const directory of directories) {
-            directoryKeys.push(metadataKey(await rpc("fs/getMetadata", { path: directory }), true));
-        }
+        const inspectDirectories = () => Promise.all(directories.map(async directory =>
+            metadataKey(await rpc("fs/getMetadata", { path: directory }), true)));
+        const directoryKeys = await inspectDirectories();
         const inspectFile = async () => {
             try { return metadataKey(await rpc("fs/getMetadata", { path: file }), false); }
             catch (error) { if (error.code === "ENOENT") return null; throw error; }
         };
         const before = await inspectFile();
         if (before !== null) throw new Error("Snapshot request destination already exists");
-        for (let index = 0; index < directories.length; index++) {
-            if (metadataKey(await rpc("fs/getMetadata", { path: directories[index] }), true) !== directoryKeys[index]) {
-                throw new Error("Snapshot request directory changed");
-            }
+        const confirmedDirectories = await inspectDirectories();
+        if (confirmedDirectories.some((key, index) => key !== directoryKeys[index])) {
+            throw new Error("Snapshot request directory changed");
         }
         if (await inspectFile() !== before) throw new Error("Snapshot request destination changed");
         const marker = protocol.makeRequest(threadId, { now: Date.now() });

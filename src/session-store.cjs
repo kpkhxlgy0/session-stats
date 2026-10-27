@@ -300,9 +300,22 @@ function createSessionStore({ codexHome, createMetrics, fileSystem = fs, pathApi
         if (record?.type === 'session_meta')
         {
             const meta = record.payload;
-            if (typeof meta?.id !== 'string' || meta.id.toLowerCase() !== threadId
-                || meta.session_id !== undefined && meta.session_id?.toLowerCase?.() !== threadId)
+            if (typeof meta?.id !== 'string' || meta.id.toLowerCase() !== threadId)
                 throw new Error('Mismatched rollout identity');
+            if (meta.session_id !== undefined && meta.session_id?.toLowerCase?.() !== threadId)
+            {
+                // 原生子线程的 session_id 是根会话，parent_thread_id 则是直接父线程。
+                const sessionId = typeof meta.session_id === 'string' && UuidPattern.test(meta.session_id)
+                    ? meta.session_id.toLowerCase() : null;
+                const parentId = typeof meta.parent_thread_id === 'string' && UuidPattern.test(meta.parent_thread_id)
+                    ? meta.parent_thread_id.toLowerCase() : null;
+                const spawn = meta.source?.subagent?.thread_spawn;
+                if (meta.thread_source !== 'subagent' || !sessionId || !parentId || parentId === threadId
+                    || spawn?.parent_thread_id?.toLowerCase?.() !== parentId
+                    || !Number.isSafeInteger(spawn?.depth) || spawn.depth < 1
+                    || (spawn.depth === 1) !== (sessionId === parentId))
+                    throw new Error('Mismatched rollout identity');
+            }
             if (record.ordinal !== undefined && (!Number.isSafeInteger(record.ordinal) || record.ordinal < 0))
                 throw new Error('Invalid rollout ordinal');
             // 只保留解析链所需的标量，不能把元数据中的指令/聊天内容放进缓存。

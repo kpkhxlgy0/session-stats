@@ -485,6 +485,62 @@ test("demand publication writes only a generated ID/time marker through a narrow
     await assert.rejects(f.transport.request(f.frame, "remote-control:test", "fs/writeFile", f.writes[0]));
 });
 
+test("demand publication can finish when each directory-check stage must progress together", async t => {
+    const waiting = [];
+    let stages = 0, fileChecks = 0, writes = 0;
+    const expectedDirectories = ["/remote/.codex", "/remote/.codex/.session-stats",
+        "/remote/.codex/.session-stats/requests"];
+    const f = fixture(t, (envelope, emit) => {
+        const { method, params } = envelope.request;
+        if (method === "fs/getMetadata" && !demandPattern.test(params.path)) {
+            waiting.push({ envelope, emit });
+            if (waiting.length === 3) {
+                assert.deepEqual(waiting.map(item => item.envelope.request.params.path).sort(),
+                    [...expectedDirectories].sort());
+                stages++;
+                for (const item of waiting.splice(0)) item.emit(response(item.envelope,
+                    { isFile: false, isDirectory: true, isSymlink: false, createdAtMs: 1, modifiedAtMs: 1 }));
+            }
+        } else if (method === "fs/getMetadata") {
+            assert.equal(stages, ++fileChecks, "file checks stay after the complete directory stage");
+            emit({ type: "mcp-response", hostId: envelope.hostId,
+                message: { id: envelope.request.id, error: { code: -32000, message: "ENOENT: missing" } } });
+        } else {
+            assert.equal(method, "fs/writeFile");
+            assert.equal(stages, 2);
+            assert.equal(fileChecks, 2);
+            writes++;
+            emit(response(envelope, {}));
+        }
+    });
+    await f.transport.requestSnapshot(f.frame, "remote-control:test", demandRollout, demandId,
+        { timeoutMs: 1000 });
+    assert.equal(writes, 1);
+});
+
+test("demand publication rejects a directory replaced during its second verification stage", async t => {
+    const reads = new Map();
+    let writes = 0;
+    const f = fixture(t, (envelope, emit) => {
+        const { method, params } = envelope.request;
+        if (method === "fs/getMetadata" && demandPattern.test(params.path)) {
+            emit({ type: "mcp-response", hostId: envelope.hostId,
+                message: { id: envelope.request.id, error: { code: -32000, message: "ENOENT: missing" } } });
+        } else if (method === "fs/getMetadata") {
+            const count = (reads.get(params.path) ?? 0) + 1;
+            reads.set(params.path, count);
+            emit(response(envelope, { isFile: false, isDirectory: true, isSymlink: false,
+                createdAtMs: params.path.endsWith("/requests") && count === 2 ? 2 : 1, modifiedAtMs: 1 }));
+        } else {
+            writes++;
+            emit(response(envelope, {}));
+        }
+    });
+    await assert.rejects(f.transport.requestSnapshot(f.frame, "remote-control:test", demandRollout, demandId),
+        /directory changed/);
+    assert.equal(writes, 0);
+});
+
 test("demand publication preserves unknown destinations and linked request directories", async t => {
     for (const options of [{ existing: "user-owned notes" }, { linkedDirectory: true }]) {
         const f = demandFixture(t, options);

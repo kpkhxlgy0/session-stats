@@ -51,7 +51,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.4.1](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.4.1)。
+版本：[v0.4.2](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.4.2)。
 
 ## 本地 Inject / Uninject
 
@@ -96,6 +96,8 @@ npm run install:local
 - 运行端通过现有本地解析器读取 `$CODEX_HOME/sessions` 和 `archived_sessions`；未设置时使用 `~/.codex`。
   支持续接日志、归档和分叉，按 `history_base` 的字节/记录数边界还原有效历史，排除废弃尾部。
   fork 的 TPS 会追溯声明的父会话前缀，父历史不会混入当前分支的其他计数。计时与用量匹配、响应去重和跨轮累计平均公式保持一致。
+- 原生子代理日志的 `session_id` 可以指向根会话；解析器核对当前线程 ID、直接父线程和嵌套深度，
+  不再把这种正常的父子关系判为日志错配。该字段本身不会触发历史继承，父会话指标不会混入子代理统计。
 - 运行端也可读取 `.jsonl.zst` 压缩历史，只解码所需前缀，不把解压后的聊天内容写入磁盘。
   压缩历史按最多 64 KiB 的输入/输出块流式解压，消费完成后才继续读取；每个统计器串行解压，
   原生 Zstd 窗口上限为 128 MiB。不缓存解压日志，不再因文件超过 64 MiB 或解压前缀超过 256 MiB 而拒绝读取。
@@ -111,6 +113,8 @@ npm run install:local
   接收端最多每 10 秒更新一次 `.session-stats/requests/<会话 UUID>.<请求 UUID>.json`；
   每次请求使用新的文件名，避免过期清理误删新请求。请求最多 1 KiB，只含固定协议标识、会话 ID 和时间，由运行端约每 2 秒检查。
   普通任意文件写入不对接收器开放；请求位置、目录类型和已有文件归属必须通过校验。
+- 远程刷新请求在每个校验阶段并发检查三个目录，保留前后两阶段、目标文件检查和总超时限制，
+  减少高延迟连接上的串行等待；不会复用跨文件操作的身份校验结果。
 - 接收端通过现有 RC 连接定位当前会话，只读取固定快照路径。
   每次读取有独立的大小和超时限制；界面每次等待最多 750 毫秒后返回已确认状态，后台继续读取。
   缺失、断线或过期时提示并重试，不启动原始日志下载。
