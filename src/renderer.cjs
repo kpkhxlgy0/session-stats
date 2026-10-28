@@ -1,7 +1,9 @@
 "use strict";
 
-const { resolveConversation } = require("./binding.cjs");
+const { resolveConversation, resolveSubagent } = require("./binding.cjs");
 const ROOT = "[data-codex-composer-root]";
+const PANEL = "[data-app-shell-pane-content-viewport]";
+const TARGETS = `${ROOT}, ${PANEL}`;
 const MARKER = "[data-session-stats]";
 
 function compact(value) {
@@ -114,8 +116,24 @@ function startRenderer(api, options = {}) {
         [data-session-stats] .session-stats-group { white-space: nowrap; flex-shrink: 0; }
         [data-session-stats] .session-stats-group:first-child { margin-left: auto; }
         [data-session-stats] .session-stats-group:last-child { margin-right: auto; }
+        [data-session-stats-anchor][data-session-stats-placement="subagent"] {
+            position: absolute; bottom: 0; left: 0; right: 0; min-width: 0; z-index: 1;
+        }
+        [data-session-stats-placement="subagent"] > [data-session-stats] {
+            top: auto; bottom: 2px; left: 16px; right: 16px;
+        }
     `;
     doc.head.append(style);
+
+    function mount(root, entry) {
+        if (root.matches(PANEL)) {
+            entry.anchor.dataset.sessionStatsPlacement = "subagent";
+            entry.bar.setAttribute("aria-label", "子代理统计");
+        }
+        if (entry.anchor.parentElement !== root) {
+            root.append(entry.anchor);
+        }
+    }
 
     async function refresh(root, entry) {
         if (stopped || entry.inflight || !root.isConnected) return;
@@ -130,7 +148,7 @@ function startRenderer(api, options = {}) {
             render(entry, stats);
             if (stats.status === "ok" && !entry.logged) {
                 entry.logged = true;
-                api.log.info(`footer ready: ${hostId}/${threadId}; turns=${stats.turns}, `
+                api.log.info(`${root.matches(PANEL) ? "subagent panel" : "footer"} ready: ${hostId}/${threadId}; turns=${stats.turns}, `
                     + `steps=${stats.steps}, tps=${stats.tps}, source=${stats.source ?? "local"}`
                     + (Number.isSafeInteger(stats.snapshotRevision) ? `, revision=${stats.snapshotRevision}` : ""));
             }
@@ -146,7 +164,7 @@ function startRenderer(api, options = {}) {
         if (stopped) return;
         if (bindingRequest) { dirty = true; return; }
         dirty = false;
-        const roots = new Set(doc.querySelectorAll(ROOT));
+        const roots = new Set(doc.querySelectorAll(TARGETS));
         const visibleRoots = [...roots].filter((root) => isVisible(root, win));
         const bindings = new Map();
         const needsBridge = visibleRoots.some((root) => root.dataset.composerPlacement !== "home"
@@ -167,10 +185,15 @@ function startRenderer(api, options = {}) {
                 entry.anchor.remove(); entries.delete(root);
             }
         }
+        const resolved = new Map(visibleRoots.map(root => [root,
+            bindings.has(root.dataset.sessionStatsKey) ? bindings.get(root.dataset.sessionStatsKey)
+                : root.matches(PANEL) ? resolveSubagent(root, api) : resolveConversation(root, api, win),
+        ]));
         for (const root of roots) {
             if (!isVisible(root, win)) continue;
-            const bound = bindings.has(root.dataset.sessionStatsKey) ? bindings.get(root.dataset.sessionStatsKey)
-                : resolveConversation(root, api, win);
+            // 详情面板已有贴底统计时，不在同一子代理的输入框下再显示一次。
+            const childPanel = root.matches(ROOT) ? root.closest(PANEL) : null;
+            const bound = childPanel && resolved.get(childPanel) ? null : resolved.get(root);
             let entry = entries.get(root);
             if (!bound) {
                 if (entry) { entry.anchor.remove(); entries.delete(root); }
@@ -181,11 +204,9 @@ function startRenderer(api, options = {}) {
                 entry = { ...makeBar(doc), ...bound, inflight: null, logged: false };
                 entries.set(root, entry);
                 render(entry, null);
-                root.append(entry.anchor);
+                mount(root, entry);
                 void refresh(root, entry);
-            } else if (!entry.anchor.isConnected) {
-                root.append(entry.anchor);
-            }
+            } else mount(root, entry);
         }
     }
 
@@ -223,7 +244,7 @@ function startRenderer(api, options = {}) {
             win.removeEventListener("resize", schedule);
             doc.removeEventListener("visibilitychange", schedule);
             for (const entry of entries.values()) entry.anchor.remove();
-            for (const root of doc.querySelectorAll(ROOT)) delete root.dataset.sessionStatsKey;
+            for (const root of doc.querySelectorAll(TARGETS)) delete root.dataset.sessionStatsKey;
             entries.clear(); style.remove();
         },
     };

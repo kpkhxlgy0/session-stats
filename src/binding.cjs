@@ -99,18 +99,39 @@ function createBindings() {
         return windowRoute ? bind(windowRoute, hosts, routes) : null;
     }
 
+    function resolveSubagent(root, api) {
+        const fiber = currentFiber(api.react?.getFiber(root));
+        for (let node = fiber, depth = 0; node && depth < 80; node = node.return, depth++) {
+            const props = node.memoizedProps;
+            if (!props || typeof props !== "object"
+                || !Object.prototype.hasOwnProperty.call(props, "headerRows")) continue;
+            if (!Array.isArray(props.headerRows)) return null;
+            const details = props.headerRows.filter((row) => row?.id === "subagent-detail");
+            if (details.length !== 1) return null;
+            const contentProps = details[0].content?.props;
+            const candidate = identity({ conversationId: contentProps?.conversationId, hostId: contentProps?.hostId });
+            if (!candidate || candidate.hostId === undefined) return null;
+            return bind(candidate, [], []);
+        }
+        return null;
+    }
+
     function readBindings() {
         const api = { react: { getFiber(root) {
             const key = Object.keys(root).find((name) => name.startsWith("__reactFiber"));
             return key ? root[key] : null;
         } } };
-        return [...document.querySelectorAll("[data-codex-composer-root][data-session-stats-key]")]
-            .map((root) => ({ key: root.dataset.sessionStatsKey, bound: resolveConversation(root, api, window) }));
+        return [...document.querySelectorAll("[data-codex-composer-root][data-session-stats-key],"
+            + "[data-app-shell-pane-content-viewport][data-session-stats-key]")]
+            .map((root) => ({ key: root.dataset.sessionStatsKey,
+                bound: root.hasAttribute("data-codex-composer-root")
+                    ? resolveConversation(root, api, window) : resolveSubagent(root, api) }));
     }
-    return { resolveConversation, readBindings };
+    return { resolveConversation, resolveSubagent, readBindings };
 }
 
 module.exports = {
     resolveConversation: createBindings().resolveConversation,
+    resolveSubagent: createBindings().resolveSubagent,
     bindingScript: `(${createBindings.toString()})().readBindings()`,
 };

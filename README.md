@@ -9,6 +9,11 @@ Codex++ tweak，在当前会话输入框底部显示：
 不显示上下文占用。统计行居中放在输入框下方已有的留白内，不占布局高度、不把输入框往上顶。
 适配浅色、深色主题，窄窗口可横向滚动；鼠标停在指标上可查看口径。
 
+打开 Subagents 中某个子代理的详情时，在面板底部居中悬浮显示同一组指标，距底边 2px。
+统计行不占布局高度、不增加底部留白，不挤压正文或输入框。
+统计只属于当前选中的子代理，切换子代理或主机时随之更新；返回列表或关闭面板后移除。
+可交互子代理的输入框下方不重复显示统计。缺少有效 TPS 样本时仍显示 `—`。
+
 支持本地及 Codex 已连接的远程主机会话，包括 Remote Control 主机。运行端读取自己的会话日志，
 生成小型统计快照，本地与远程显示同一版本的结果。共享统计需要两端都更新并启用 Session Stats。
 接收端只读取统计快照，不扫描远程历史目录，也不会回退下载原始会话日志。
@@ -51,7 +56,7 @@ TPS 思路参考 [dongyue-19/codex-statusbar](https://github.com/dongyue-19/code
 Store 固定到审核过的完整提交 SHA；安装后无需运行 `npm install` 或构建。
 
 源码：[kpkhxlgy0/session-stats](https://github.com/kpkhxlgy0/session-stats)。
-版本：[v0.4.2](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.4.2)。
+版本：[v0.5.0](https://github.com/kpkhxlgy0/session-stats/releases/tag/v0.5.0)。
 
 ## 本地 Inject / Uninject
 
