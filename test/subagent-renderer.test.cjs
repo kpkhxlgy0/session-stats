@@ -13,12 +13,17 @@ const sample = { status: "ok", turns: 1, steps: 10, tps: 83, totalTokens: 657675
     inputTokens: 650000, outputTokens: 7675, cachedInputTokens: 570000, cacheHit: 0.88 };
 
 function fixture(t) {
-    const dom = new JSDOM('<main><div data-codex-composer-root></div></main>'
-        + '<aside><header>Selected child</header><div data-app-shell-pane-content-viewport="true" style="position: relative">'
-        + '<article>Transcript</article></div></aside>',
+    const dom = new JSDOM('<style>.relative { position: relative }'
+        + '.absolute { position: absolute } .inset-y-0 { top: 0; bottom: 0 }</style>'
+        + '<main><div data-codex-composer-root></div></main>'
+        + '<aside><header>Selected child</header>'
+        + '<div data-app-shell-pane-content-viewport="true" class="relative min-h-0 min-w-0 flex-1 overflow-hidden">'
+        + '<div class="absolute inset-y-0 left-0 min-h-0 w-full min-w-0">'
+        + '<article>Transcript</article></div></div></aside>',
     { url: `https://codex.local/local/${parentId}`, runScripts: "outside-only" });
     const doc = dom.window.document;
     const viewport = doc.querySelector(PANEL);
+    const content = viewport.firstElementChild;
     const composer = doc.querySelector("[data-codex-composer-root]");
     for (const root of [viewport, composer]) root.getClientRects = () => [{ width: 600, height: 300 }];
     const layout = { memoizedProps: { headerRows: [
@@ -47,20 +52,20 @@ function fixture(t) {
         layout.memoizedProps.headerRows[0].content.props = { conversationId: threadId, hostId };
         viewport.querySelector("article").textContent = `Selected ${threadId}/${hostId}`;
     };
-    return { dom, doc, viewport, composer, layout, api, requests, start, change };
+    return { dom, doc, viewport, content, composer, layout, api, requests, start, change };
 }
 
 async function settle(dom) {
     await new Promise(resolve => dom.window.setTimeout(resolve, 40));
 }
 
-test("selected subagent stats overlay the pane bottom without reserving layout space", async t => {
+test("selected subagent stats reserve a 24px footer below the transcript viewport", async t => {
     const f = fixture(t);
     const viewportStyle = f.viewport.getAttribute("style");
     const controller = f.start();
     await settle(f.dom);
     const anchor = f.viewport.querySelector(":scope > [data-session-stats-anchor]");
-    assert.ok(anchor, "mounts a fixed overlay directly in the pane viewport");
+    assert.ok(anchor, "mounts the footer directly in the pane viewport");
     assert.equal(f.viewport.previousElementSibling.tagName, "HEADER", "no extra row between header and content");
     assert.equal(anchor.dataset.sessionStatsPlacement, "subagent");
     assert.match(anchor.textContent, /1 turns.*10 steps.*83 tok\/s.*657\.7K tok.*Cache hit 88%/);
@@ -69,11 +74,13 @@ test("selected subagent stats overlay the pane bottom without reserving layout s
     assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 2);
     assert.ok(f.requests.some(bound => bound.threadId === childId && bound.hostId === "local"));
     const style = f.dom.window.getComputedStyle(anchor);
-    assert.equal(style.position, "absolute", "overlay does not participate in flex layout");
-    assert.equal(style.height, "0px");
+    assert.equal(style.position, "absolute");
+    assert.equal(style.height, "24px");
     assert.equal(style.bottom, "0px");
     assert.equal(f.dom.window.getComputedStyle(anchor.firstElementChild).bottom, "2px");
-    assert.equal(f.viewport.getAttribute("style"), viewportStyle, "does not add padding or resize the viewport");
+    assert.equal(f.dom.window.getComputedStyle(f.content).bottom, "24px", "the scrolling content ends above the footer");
+    assert.equal(f.content.getAttribute("style"), null, "preserves the app's inline styles");
+    assert.equal(f.viewport.getAttribute("style"), viewportStyle);
     assert.equal(f.viewport.querySelector("article").getAttribute("style"), null);
     assert.equal(f.dom.window.getComputedStyle(f.composer.querySelector("[data-session-stats-anchor]")).height, "0px");
     f.viewport.querySelector("article").append(f.doc.createElement("span"));
@@ -82,6 +89,8 @@ test("selected subagent stats overlay the pane bottom without reserving layout s
     controller.stop();
     assert.equal(f.doc.querySelector("[data-session-stats-anchor]"), null);
     assert.equal(f.doc.querySelector("[data-session-stats-key]"), null);
+    assert.equal(f.dom.window.getComputedStyle(f.content).bottom, "0px", "disable restores the content area");
+    assert.equal(f.viewport.hasAttribute("data-session-stats-panel"), false);
 });
 
 test("child and host switches discard late replies from the previous panel selection", async t => {
@@ -129,6 +138,8 @@ test("unrelated panes, the child list and invalid selected identities cannot inh
     f.start();
     await settle(f.dom);
     assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 1);
+    assert.equal(f.dom.window.getComputedStyle(f.content).bottom, "0px", "unrelated panes keep their full content height");
+    assert.equal(f.viewport.hasAttribute("data-session-stats-panel"), false);
     assert.ok(f.requests.every(bound => bound.threadId === parentId));
     f.layout.memoizedProps.headerRows = [{ id: "subagent-detail", content: { props: { hostId: "local" } } }];
     f.viewport.querySelector("article").textContent = "Loading child";
@@ -140,24 +151,31 @@ test("returning to the list, hiding and removing the pane remove its statistics 
     const f = fixture(t);
     f.start();
     await settle(f.dom);
+    assert.equal(f.dom.window.getComputedStyle(f.content).bottom, "24px");
     const headerRows = f.layout.memoizedProps.headerRows;
     f.layout.memoizedProps.headerRows = [];
     f.viewport.querySelector("article").textContent = "Subagents list";
     await settle(f.dom);
     assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 1);
+    assert.equal(f.dom.window.getComputedStyle(f.content).bottom, "0px", "pane reuse restores the list layout");
+    assert.equal(f.viewport.hasAttribute("data-session-stats-panel"), false);
     f.layout.memoizedProps.headerRows = headerRows;
     f.viewport.querySelector("article").textContent = "Selected child";
     await settle(f.dom);
     assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 2);
+    assert.equal(f.dom.window.getComputedStyle(f.content).bottom, "24px");
     f.viewport.parentElement.hidden = true;
     await settle(f.dom);
     assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 1);
+    assert.equal(f.dom.window.getComputedStyle(f.content).bottom, "0px", "hiding restores the content area");
+    assert.equal(f.viewport.hasAttribute("data-session-stats-panel"), false);
     f.viewport.parentElement.hidden = false;
     await settle(f.dom);
     assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 2);
     f.viewport.remove();
     await settle(f.dom);
-    assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 1, "no orphaned overlay");
+    assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 1, "no orphaned footer");
+    assert.equal(f.viewport.hasAttribute("data-session-stats-panel"), false, "unmount releases the pane layout");
 });
 
 test("React replacing the transcript viewport remounts exactly one child row", async t => {
@@ -165,16 +183,18 @@ test("React replacing the transcript viewport remounts exactly one child row", a
     f.start();
     await settle(f.dom);
     const replacement = f.viewport.cloneNode(false);
-    replacement.append(f.viewport.querySelector("article").cloneNode(true));
+    replacement.append(f.content.cloneNode(true));
     replacement.__reactFiberTest = f.viewport.__reactFiberTest;
     replacement.getClientRects = f.viewport.getClientRects;
     f.viewport.replaceWith(replacement);
     await settle(f.dom);
     assert.ok(replacement.querySelector(":scope > [data-session-stats-anchor]"));
     assert.equal(f.doc.querySelectorAll("[data-session-stats]").length, 2);
+    assert.equal(f.viewport.hasAttribute("data-session-stats-panel"), false);
+    assert.equal(f.dom.window.getComputedStyle(replacement.firstElementChild).bottom, "24px");
 });
 
-test("an interactive child has one bottom overlay without a duplicate composer footer", async t => {
+test("an interactive child has one reserved footer without a duplicate composer footer", async t => {
     const f = fixture(t);
     const childComposer = f.doc.createElement("div");
     childComposer.dataset.codexComposerRoot = "";
@@ -182,7 +202,7 @@ test("an interactive child has one bottom overlay without a duplicate composer f
     childComposer.__reactFiberTest = { memoizedProps: {
         value: { kind: "local", conversationId: childId, hostId: "local" },
     } };
-    f.viewport.append(childComposer);
+    f.content.append(childComposer);
     f.start();
     await settle(f.dom);
     assert.equal(childComposer.querySelector("[data-session-stats]"), null);

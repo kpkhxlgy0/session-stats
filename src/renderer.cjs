@@ -117,7 +117,11 @@ function startRenderer(api, options = {}) {
         [data-session-stats] .session-stats-group:first-child { margin-left: auto; }
         [data-session-stats] .session-stats-group:last-child { margin-right: auto; }
         [data-session-stats-anchor][data-session-stats-placement="subagent"] {
-            position: absolute; bottom: 0; left: 0; right: 0; min-width: 0; z-index: 1;
+            position: absolute; bottom: 0; left: 0; right: 0; height: 24px; min-width: 0; z-index: 1;
+        }
+        [data-app-shell-pane-content-viewport][data-session-stats-panel]
+            > .absolute.inset-y-0:not([data-session-stats-anchor]) {
+            bottom: 24px;
         }
         [data-session-stats-placement="subagent"] > [data-session-stats] {
             top: auto; bottom: 2px; left: 16px; right: 16px;
@@ -127,12 +131,19 @@ function startRenderer(api, options = {}) {
 
     function mount(root, entry) {
         if (root.matches(PANEL)) {
+            root.dataset.sessionStatsPanel = "";
             entry.anchor.dataset.sessionStatsPlacement = "subagent";
             entry.bar.setAttribute("aria-label", "子代理统计");
         }
         if (entry.anchor.parentElement !== root) {
             root.append(entry.anchor);
         }
+    }
+
+    function unmount(root, entry) {
+        entry.anchor.remove();
+        delete root.dataset.sessionStatsPanel;
+        entries.delete(root);
     }
 
     async function refresh(root, entry) {
@@ -182,7 +193,7 @@ function startRenderer(api, options = {}) {
         }
         for (const [root, entry] of entries) {
             if (!roots.has(root) || !isVisible(root, win)) {
-                entry.anchor.remove(); entries.delete(root);
+                unmount(root, entry);
             }
         }
         const resolved = new Map(visibleRoots.map(root => [root,
@@ -196,11 +207,11 @@ function startRenderer(api, options = {}) {
             const bound = childPanel && resolved.get(childPanel) ? null : resolved.get(root);
             let entry = entries.get(root);
             if (!bound) {
-                if (entry) { entry.anchor.remove(); entries.delete(root); }
+                if (entry) unmount(root, entry);
                 continue;
             }
             if (!entry || entry.threadId !== bound.threadId || entry.hostId !== bound.hostId) {
-                entry?.anchor.remove();
+                if (entry) unmount(root, entry);
                 entry = { ...makeBar(doc), ...bound, inflight: null, logged: false };
                 entries.set(root, entry);
                 render(entry, null);
@@ -243,7 +254,7 @@ function startRenderer(api, options = {}) {
             win.removeEventListener("hashchange", schedule);
             win.removeEventListener("resize", schedule);
             doc.removeEventListener("visibilitychange", schedule);
-            for (const entry of entries.values()) entry.anchor.remove();
+            for (const [root, entry] of entries) unmount(root, entry);
             for (const root of doc.querySelectorAll(TARGETS)) delete root.dataset.sessionStatsKey;
             entries.clear(); style.remove();
         },
