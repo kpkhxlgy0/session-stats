@@ -102,7 +102,7 @@ test('unchanged samples retain their revision until heartbeat and changed metric
     assert.equal((await f.read(ThreadId)).stats.totalTokens, 1201);
 });
 
-test('concurrent explicit requests coalesce while unrelated background work cannot delay them', async t =>
+test('concurrent explicit requests coalesce while another visible target cannot delay them', async t =>
 {
     const background = deferred(), entered = deferred();
     let explicitCalls = 0;
@@ -114,7 +114,7 @@ test('concurrent explicit requests coalesce while unrelated background work cann
             return { ...Stats };
         },
     } });
-    const refreshing = f.publisher.refresh();
+    const refreshing = f.publisher.getStats(OtherThreadId, { ownerId: 'other-view' });
     await entered.promise;
     const [first, second] = await Promise.all([
         f.publisher.getStats(ThreadId), f.publisher.getStats(ThreadId),
@@ -126,21 +126,22 @@ test('concurrent explicit requests coalesce while unrelated background work cann
     await refreshing;
 });
 
-test('background polling updates tracked sessions without overlapping discovery loops', async t =>
+test('polling updates an owned visible session without running recent discovery', async t =>
 {
     let tokens = 1200, discoveryCalls = 0;
     const f = await fixture(t, { pollMs: 5, discover: async () => { discoveryCalls++; return [ThreadId]; },
         store: { getStats: async () => ({ ...Stats, totalTokens: tokens }) } });
+    await f.publisher.getStats(ThreadId, { ownerId: 'view' });
     await f.publisher.start();
     tokens = 1234;
     f.setTime(102000);
     await eventually(async () => (await f.read(ThreadId)).stats.totalTokens === 1234);
-    assert.equal(discoveryCalls, 1);
+    assert.equal(discoveryCalls, 0);
     await f.publisher.dispose();
     assert.equal((await f.read(ThreadId)).stats.totalTokens, 1234);
 });
 
-test('default discovery publishes a hidden session using the authoritative local parser', async t =>
+test('an explicit request publishes a session using the authoritative local parser', async t =>
 {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-snapshot-parser-'));
     const store = createSessionStore({ codexHome: root });
@@ -157,7 +158,7 @@ test('default discovery publishes a hidden session using the authoritative local
         { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'first' } },
     ];
     await writeSession(root, ThreadId, { content: records.map(record => JSON.stringify(record) + '\n').join('') });
-    await publisher.refresh();
+    await publisher.getStats(ThreadId);
     const written = JSON.parse(await fs.readFile(path.join(root, '.session-stats', `${ThreadId}.json`), 'utf8'));
     assert.equal(written.stats.totalTokens, 1200);
     assert.equal(written.stats.tps, 200);
@@ -166,7 +167,7 @@ test('default discovery publishes a hidden session using the authoritative local
     for (const key of Object.keys(Stats)) assert.equal(written.stats[key], raw[key], key);
 });
 
-test('discovery checks recent exact names and refreshes hidden interest only every fifteen seconds', async t =>
+test('recent and archived sessions remain untouched until explicitly requested', async t =>
 {
     const f = await fixture(t, { discover: undefined });
     await writeSession(f.codexHome, ThreadId);
@@ -177,17 +178,20 @@ test('discovery checks recent exact names and refreshes hidden interest only eve
     await assert.rejects(fs.readFile(f.filename(OtherThreadId)), { code: 'ENOENT' });
     f.setTime(115000);
     await f.publisher.refresh();
+    await assert.rejects(fs.readFile(f.filename(ThreadId)), { code: 'ENOENT' });
+    await assert.rejects(fs.readFile(f.filename(OtherThreadId)), { code: 'ENOENT' });
+    await f.publisher.getStats(OtherThreadId);
     assert.equal((await f.read(OtherThreadId)).threadId, OtherThreadId);
 });
 
-test('interest stays bounded to thirty-two IDs while evicted snapshot files remain for expiry', async t =>
+test('one-shot cache stays bounded without polling completed requests and leaves snapshots for expiry', async t =>
 {
     const observed = [];
     const f = await fixture(t, { store: { getStats: async threadId => { observed.push(threadId); return { ...Stats }; } } });
     for (let i = 1; i <= 33; i++) await f.publisher.getStats(id(i));
     observed.length = 0;
     await f.publisher.refresh();
-    assert.equal(observed.length, 32);
+    assert.equal(observed.length, 0);
     assert.equal(observed.includes(id(1)), false);
     assert.equal((await f.read(id(1))).threadId, id(1));
 });
@@ -207,7 +211,7 @@ test('a full in-flight interest cache refuses extra work and disposal cancels ev
     assert.deepEqual(await fs.readdir(f.codexHome), []);
 });
 
-test('overlapping background refreshes share one pass and publish each discovered ID only once', async t =>
+test('overlapping refreshes coalesce each explicitly visible target', async t =>
 {
     const blocked = deferred(), entered = deferred();
     const calls = [];
@@ -217,14 +221,15 @@ test('overlapping background refreshes share one pass and publish each discovere
         if (threadId === ThreadId) { entered.resolve(); await blocked.promise; }
         return { ...Stats };
     } } });
-    const first = f.publisher.refresh();
+    const first = f.publisher.getStats(ThreadId, { ownerId: 'first' });
     await entered.promise;
+    const other = f.publisher.getStats(OtherThreadId, { ownerId: 'other' });
     const overlapping = Array.from({ length: 5 }, () => f.publisher.refresh());
     blocked.resolve();
-    await Promise.all([first, ...overlapping]);
+    await Promise.all([first, other, ...overlapping]);
     assert.deepEqual(calls, [ThreadId, OtherThreadId]);
-    assert.equal((await f.read(ThreadId)).revision, 1);
-    assert.equal((await f.read(OtherThreadId)).revision, 2);
+    assert.equal((await f.read(ThreadId)).stats.status, 'ok');
+    assert.equal((await f.read(OtherThreadId)).stats.status, 'ok');
 });
 
 test('unknown destinations fail closed without deleting files', async t =>
@@ -462,18 +467,12 @@ test('disposal cancels pending source reads and preserves already published fina
     assert.equal((await f.publisher.getStats(ThreadId)).unavailableReason, 'snapshot-publish-failed');
 });
 
-test('disposal cancels an uncooperative discovery without publishing its late result', async t =>
+test('idle startup and disposal do not enter even an uncooperative discovery', async t =>
 {
-    const waiting = deferred(), entered = deferred();
-    const f = await fixture(t, { discover: async () => { entered.resolve(); return waiting.promise; } });
-    const refreshing = f.publisher.refresh();
-    await entered.promise;
-    const disposing = f.publisher.dispose();
-    const stoppedWithoutDiscovery = await Promise.race([
-        disposing.then(() => true), new Promise(resolve => setTimeout(() => resolve(false), 100)),
-    ]);
-    waiting.resolve([ThreadId]);
-    await Promise.all([disposing, refreshing]);
-    assert.equal(stoppedWithoutDiscovery, true, 'Stopping must not wait for discovery');
-    assert.deepEqual(await fs.readdir(f.codexHome), []);
+    let discoveries = 0;
+    const f = await fixture(t, { discover: () => { discoveries++; return new Promise(() => {}); } });
+    await f.publisher.start();
+    await f.publisher.dispose();
+    assert.equal(discoveries, 0);
+    assert.deepEqual(await fs.readdir(f.codexHome), ['.session-stats']);
 });

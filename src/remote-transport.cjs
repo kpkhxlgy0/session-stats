@@ -210,6 +210,8 @@ function requestInPage(options) {
 
 function createRemoteTransport({ timeoutMs, maxChars } = {}) {
     const pending = new Set();
+    const leases = new Map();
+    let nextLeaseRevision = 0;
     const cancelEvent = `session-stats-cancel-${randomUUID()}`;
     let disposed = false;
 
@@ -268,12 +270,14 @@ function createRemoteTransport({ timeoutMs, maxChars } = {}) {
         return send(frame, hostId, method, params, limits);
     }
 
-    async function requestSnapshot(frame, hostId, rolloutPath, threadId, options = {}) {
+    async function writeSnapshotRequest(frame, hostId, rolloutPath, threadId, options = {}) {
         const protocol = createSnapshotProtocol();
         const context = protocol.remoteContext(rolloutPath, threadId);
         if (!context || typeof hostId !== "string" || !hostId.length || hostId.length > 512
             || hostId.toLowerCase() === "local" || /[\u0000-\u001f\u007f-\u009f]/.test(hostId)
             || !options || typeof options !== "object" || Array.isArray(options)
+            || options.consumerId !== undefined && (!protocol.normalizeThreadId(options.consumerId)
+                || typeof options.active !== "boolean")
             || options.timeoutMs !== undefined && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0)) {
             throw new Error("Invalid snapshot publication request");
         }
@@ -289,7 +293,8 @@ function createRemoteTransport({ timeoutMs, maxChars } = {}) {
             check();
             return result;
         };
-        // Each lease is immutable: cleanup of an expired lease cannot unlink a newer renewal.
+        // Every marker is immutable; an expired-marker cleanup cannot unlink a newer renewal.
+        const consumerId = options.consumerId && protocol.normalizeThreadId(options.consumerId);
         const file = protocol.requestPath(context.codexHome, threadId, randomUUID(), context.pathApi);
         const directories = [context.codexHome, context.directory, context.pathApi.dirname(file)];
         const metadataKey = (info, directory) => {
@@ -314,11 +319,22 @@ function createRemoteTransport({ timeoutMs, maxChars } = {}) {
             throw new Error("Snapshot request directory changed");
         }
         if (await inspectFile() !== before) throw new Error("Snapshot request destination changed");
-        const marker = protocol.makeRequest(threadId, { now: Date.now() });
+        const marker = protocol.makeRequest(threadId, { now: Date.now(),
+            ...(consumerId ? { consumerId, active: options.active, sequence: ++nextLeaseRevision } : {}) });
         if (!marker) throw new Error("Invalid snapshot publication request");
         check();
         await rpc("fs/writeFile", { path: file, dataBase64: Buffer.from(JSON.stringify(marker) + "\n").toString("base64") });
         return { requested: true };
+    }
+
+    function requestSnapshot(frame, hostId, rolloutPath, threadId, options = {}) {
+        if (!options?.consumerId) return writeSnapshotRequest(frame, hostId, rolloutPath, threadId, options);
+        const key = JSON.stringify([hostId, threadId, options.consumerId]);
+        const previous = leases.get(key) ?? Promise.resolve();
+        const task = previous.catch(() => {}).then(() => writeSnapshotRequest(frame, hostId, rolloutPath, threadId, options));
+        leases.set(key, task);
+        task.finally(() => { if (leases.get(key) === task) leases.delete(key); }).catch(() => {});
+        return task;
     }
 
     function dispose() {

@@ -321,8 +321,8 @@ test('binds demand markers to the expected thread and freshness window', () =>
         { threadId: ThreadId, now: Now, ...expected });
     assert.deepEqual(parse(Now, { threadId: OtherThreadId }), { ok: false, reason: 'identity' });
     assert.deepEqual(parse(Now, { threadId: null }), { ok: false, reason: 'identity' });
-    assert.equal(parse(Now - 30000).ok, true);
-    assert.deepEqual(parse(Now - 30001), { ok: false, reason: 'expired' });
+    assert.equal(parse(Now - 8000).ok, true);
+    assert.deepEqual(parse(Now - 8001), { ok: false, reason: 'expired' });
     assert.equal(parse(Now + 5000).ok, true);
     assert.deepEqual(parse(Now + 5001), { ok: false, reason: 'future' });
     assert.deepEqual(parse(Now - 30001, { now: Now - 30001 }), {

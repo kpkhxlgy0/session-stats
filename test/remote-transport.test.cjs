@@ -485,6 +485,63 @@ test("demand publication writes only a generated ID/time marker through a narrow
     await assert.rejects(f.transport.request(f.frame, "remote-control:test", "fs/writeFile", f.writes[0]));
 });
 
+test("consumer leases use immutable nonce files and release advances the same consumer sequence", async t => {
+    const files = new Map(), writes = [];
+    const consumerId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const f = fixture(t, (envelope, emit) => {
+        const { method, params } = envelope.request;
+        if (method === "fs/getMetadata") {
+            const file = demandPattern.test(params.path);
+            if (file && !files.has(params.path)) {
+                emit({ type: "mcp-response", hostId: envelope.hostId,
+                    message: { id: envelope.request.id, error: { code: "ENOENT" } } });
+            } else emit(response(envelope, { isFile: file, isDirectory: !file, isSymlink: false,
+                createdAtMs: 1, modifiedAtMs: 1 }));
+        } else if (method === "fs/readFile") {
+            emit(response(envelope, { dataBase64: files.get(params.path) }));
+        } else if (method === "fs/writeFile") {
+            files.set(params.path, params.dataBase64); writes.push(params); emit(response(envelope, {}));
+        } else assert.fail(method);
+    });
+    for (const active of [true, true, false]) {
+        await f.transport.requestSnapshot(f.frame, "remote-control:test", demandRollout, demandId, { consumerId, active });
+    }
+    assert.equal(new Set(writes.map(write => write.path)).size, 3);
+    assert.deepEqual(writes.map(write => JSON.parse(Buffer.from(write.dataBase64, "base64")).active), [true, true, false]);
+    assert.equal(JSON.parse(Buffer.from(writes[2].dataBase64, "base64")).consumerId, consumerId);
+    assert.deepEqual(writes.map(write => JSON.parse(Buffer.from(write.dataBase64, "base64")).sequence), [1, 2, 3]);
+});
+
+test("a cancellation waits behind an already dispatched lease write and remains the final marker", async t => {
+    const writes = [];
+    let unblock;
+    const consumerId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const f = fixture(t, (envelope, emit) => {
+        const { method, params } = envelope.request;
+        if (method === "fs/getMetadata") {
+            const file = demandPattern.test(params.path);
+            if (file && !writes.some(write => write.path === params.path)) emit({ type: "mcp-response", hostId: envelope.hostId,
+                message: { id: envelope.request.id, error: { code: "ENOENT" } } });
+            else emit(response(envelope, { isFile: file, isDirectory: !file, isSymlink: false,
+                createdAtMs: 1, modifiedAtMs: 1 }));
+        } else if (method === "fs/readFile") emit(response(envelope, { dataBase64: writes.at(-1).dataBase64 }));
+        else if (method === "fs/writeFile") {
+            writes.push(params);
+            if (writes.length === 1) unblock = () => emit(response(envelope, {}));
+            else emit(response(envelope, {}));
+        }
+    });
+    const active = f.transport.requestSnapshot(f.frame, "remote-control:test", demandRollout, demandId, { consumerId, active: true });
+    while (!unblock) await new Promise(resolve => setImmediate(resolve));
+    const otherFrame = { executeJavaScript: f.frame.executeJavaScript };
+    const release = f.transport.requestSnapshot(otherFrame, "remote-control:test", demandRollout, demandId, { consumerId, active: false });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(writes.length, 1);
+    unblock();
+    await Promise.all([active, release]);
+    assert.equal(JSON.parse(Buffer.from(writes.at(-1).dataBase64, "base64")).active, false);
+});
+
 test("demand publication can finish when each directory-check stage must progress together", async t => {
     const waiting = [];
     let stages = 0, fileChecks = 0, writes = 0;

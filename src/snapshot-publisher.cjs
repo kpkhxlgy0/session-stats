@@ -4,10 +4,9 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { createSnapshotProtocol } = require('./snapshot.cjs');
-const { discoverRecentThreadIds, discoverSnapshotRequests } = require('./snapshot-discovery.cjs');
+const { discoverSnapshotRequests } = require('./snapshot-discovery.cjs');
 
 const MaxTrackedIds = 32;
-const DiscoveryMs = 15000;
 
 function fileIdentity(info) { return `${info.dev}:${info.ino}:${info.birthtimeMs}`; }
 
@@ -25,17 +24,18 @@ function ownUser(info) { return typeof process.getuid !== 'function' || info.uid
 
 function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 2000,
     heartbeatMs = 10000, publisherId = randomUUID(), installationRoot = path.resolve(__dirname, '..'),
-    discover = discoverRecentThreadIds } = {})
+    } = {})
 {
     const protocol = createSnapshotProtocol();
     const states = new Map();
+    const owners = new Map();
     const ownTemps = new Map();
     const cancellation = new AbortController();
     const waiters = new Set();
     const home = typeof codexHome === 'string' && path.isAbsolute(codexHome) ? path.resolve(codexHome) : null;
     const interval = Number.isFinite(pollMs) && pollMs > 0 ? pollMs : protocol.pollMs;
     const heartbeat = Number.isFinite(heartbeatMs) && heartbeatMs > 0 ? heartbeatMs : protocol.heartbeatMs;
-    let timer, refreshPending, requestsPending, disposePending, discoveryAt = -Infinity;
+    let timer, refreshPending, requestsPending, disposePending;
     let disposed = false, started = false, epoch = 0, revision = 0;
 
     function unavailable(threadId)
@@ -44,16 +44,31 @@ function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 20
             source: 'snapshot', unavailableReason: 'snapshot-publish-failed' };
     }
 
-    function active(runEpoch) { return !disposed && epoch === runEpoch; }
+    function interested(state) { return state.owners.size > 0 || state.readers > 0 || now() <= state.requestedUntil; }
 
-    async function untilStopped(work)
+    function active(runEpoch)
+    {
+        if (typeof runEpoch === 'object') return active(runEpoch.epoch)
+            && runEpoch.state.generation === runEpoch.generation && interested(runEpoch.state);
+        return !disposed && epoch === runEpoch;
+    }
+
+    function invalidate(state)
+    {
+        if (interested(state)) return;
+        state.generation++;
+        for (const cancel of state.cancellations) cancel();
+    }
+
+    async function untilStopped(work, state)
     {
         let cancel;
         const cancelled = new Promise(resolve => { cancel = resolve; });
         waiters.add(cancel);
+        state?.cancellations.add(cancel);
         if (disposed) cancel();
         try { return await Promise.race([work, cancelled]); }
-        finally { waiters.delete(cancel); }
+        finally { waiters.delete(cancel); state?.cancellations.delete(cancel); }
     }
 
     async function directoryInfo(directory)
@@ -216,21 +231,20 @@ function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 20
         return sample;
     }
 
-    function track(threadId, requestedAt = null)
+    function track(threadId)
     {
         let state = states.get(threadId);
         if (!state)
         {
             if (states.size >= MaxTrackedIds)
             {
-                const idle = [...states].find(([, entry]) => !entry.pending);
+                const idle = [...states].find(([, entry]) => !entry.pending && !interested(entry));
                 if (!idle) return null;
                 states.delete(idle[0]);
             }
-            state = { id: threadId, snapshot: null, pending: null, persistent: false, requestedUntil: -Infinity };
+            state = { id: threadId, snapshot: null, pending: null, owners: new Set(), readers: 0,
+                generation: 0, cancellations: new Set(), requestedUntil: -Infinity };
         }
-        if (requestedAt === null) state.persistent = true;
-        else state.requestedUntil = Math.max(state.requestedUntil, requestedAt + protocol.maxAgeMs);
         states.delete(threadId);
         states.set(threadId, state);
         return state;
@@ -239,11 +253,11 @@ function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 20
     function poll(state)
     {
         if (state.pending) return state.pending;
-        const runEpoch = epoch;
+        const runEpoch = { epoch, state, generation: state.generation };
         state.pending = (async () =>
         {
             if (!active(runEpoch)) return null;
-            const raw = await untilStopped(store.getStats(state.id));
+            const raw = await untilStopped(store.getStats(state.id), state);
             if (!active(runEpoch)) return null;
             if (raw?.threadId !== undefined && protocol.normalizeThreadId(raw.threadId) !== state.id)
                 throw new Error('Mismatched source identity');
@@ -263,8 +277,6 @@ function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 20
             .finally(() =>
             {
                 state.pending = null;
-                if (!state.persistent && now() > state.requestedUntil && states.get(state.id) === state)
-                    states.delete(state.id);
             });
         return state.pending;
     }
@@ -305,58 +317,54 @@ function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 20
                 { now: now(), signal: cancellation.signal });
             await confirmDirectories(expected);
             if (!active(runEpoch)) return;
-            const time = now();
-            for (const [threadId, state] of states)
-                if (!state.persistent && !state.pending && time > state.requestedUntil) states.delete(threadId);
+            for (const state of states.values()) state.requestedUntil = -Infinity;
+            const consumers = new Map();
             for (const marker of markers)
             {
                 if (!active(runEpoch)) return;
                 if (marker.expired) await removeExpiredRequest(marker, expected, runEpoch);
                 else
                 {
-                    const state = track(marker.request.threadId, marker.request.requestedAt);
-                    if (state) void poll(state);
+                    const request = marker.request;
+                    const key = request.schemaVersion === 2
+                        ? JSON.stringify([request.threadId, request.consumerId]) : marker.file;
+                    const previous = consumers.get(key);
+                    if (!previous || request.sequence > previous.sequence
+                        || request.sequence === previous.sequence && request.requestedAt > previous.requestedAt)
+                        consumers.set(key, request);
                 }
+            }
+            for (const request of consumers.values())
+            {
+                if (request.active === false) continue;
+                const state = track(request.threadId);
+                if (state) state.requestedUntil = Math.max(state.requestedUntil, request.requestedAt + protocol.leaseMs);
+            }
+            for (const state of states.values())
+            {
+                invalidate(state);
+                // A blocked visible parser must not stall another consumer's requested target.
+                if (interested(state)) void poll(state);
             }
         })().catch(() => {}).finally(() => { requestsPending = null; });
         return requestsPending;
     }
 
-    function refreshRecent()
+    function refreshInterested()
     {
         if (disposed) return Promise.resolve();
         if (refreshPending) return refreshPending;
         const runEpoch = epoch;
         refreshPending = (async () =>
         {
-            const time = now();
-            if (time < discoveryAt || time - discoveryAt >= DiscoveryMs)
-            {
-                discoveryAt = time;
-                try
-                {
-                    const recent = await untilStopped(discover(home, { signal: cancellation.signal }));
-                    if (!active(runEpoch)) return;
-                    let added = 0;
-                    for (const value of Array.isArray(recent) ? recent : [])
-                    {
-                        const threadId = protocol.normalizeThreadId(value);
-                        if (threadId && added++ < 8) track(threadId);
-                        if (added >= 8) break;
-                    }
-                }
-                catch { /* Explicit interest and previously tracked sessions can still update. */ }
-            }
+            const pending = [];
             for (const state of [...states.values()])
             {
                 if (!active(runEpoch)) return;
-                if (!state.persistent && !state.pending && now() > state.requestedUntil)
-                {
-                    if (states.get(state.id) === state) states.delete(state.id);
-                    continue;
-                }
-                if (states.get(state.id) === state) await poll(state);
+                if (!interested(state)) { invalidate(state); continue; }
+                pending.push(poll(state));
             }
+            await Promise.all(pending);
         })().catch(() => {}).finally(() => { refreshPending = null; });
         return refreshPending;
     }
@@ -364,8 +372,7 @@ function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 20
     function refresh()
     {
         if (disposed) return Promise.resolve();
-        // Demand discovery must keep running even while a recent-session parser is blocked.
-        return Promise.all([refreshRequests(), refreshRecent()]).then(() => {});
+        return refreshRequests().then(refreshInterested);
     }
 
     function start()
@@ -374,20 +381,40 @@ function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 20
         if (!started)
         {
             started = true;
-            timer = setInterval(() => { void refreshRequests(); void refreshRecent(); }, Math.max(1, interval));
+            timer = setInterval(() => { void refresh(); }, Math.max(1, interval));
             timer.unref?.();
         }
         return refresh();
     }
 
-    async function getStats(value)
+    function release(ownerId)
+    {
+        const state = owners.get(ownerId);
+        if (!state) return;
+        owners.delete(ownerId);
+        state.owners.delete(ownerId);
+        invalidate(state);
+    }
+
+    async function getStats(value, { ownerId } = {})
     {
         const threadId = protocol.normalizeThreadId(value);
         if (disposed || !threadId) return unavailable(threadId);
         const state = track(threadId);
         if (!state) return unavailable(threadId);
-        const snapshot = await poll(state);
-        return !disposed && snapshot ? protocol.toStats(snapshot) : unavailable(threadId);
+        if (ownerId !== undefined)
+        {
+            if (owners.get(ownerId) !== state) release(ownerId);
+            owners.set(ownerId, state);
+            state.owners.add(ownerId);
+        }
+        else state.readers++;
+        try
+        {
+            const snapshot = await poll(state);
+            return !disposed && snapshot ? protocol.toStats(snapshot) : unavailable(threadId);
+        }
+        finally { if (ownerId === undefined) { state.readers--; invalidate(state); } }
     }
 
     function dispose()
@@ -402,11 +429,12 @@ function createSnapshotPublisher({ codexHome, store, now = Date.now, pollMs = 20
             await Promise.allSettled([refreshPending, requestsPending, ...[...states.values()].map(state => state.pending)]);
             for (const temporary of ownTemps.keys()) await removeTemp(temporary);
             states.clear();
+            owners.clear();
         })();
         return disposePending;
     }
 
-    return { start, getStats, refresh, dispose };
+    return { start, getStats, release, refresh, dispose };
 }
 
 module.exports = { createSnapshotPublisher };

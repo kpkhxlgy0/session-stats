@@ -55,6 +55,7 @@ test("disable and hot reload release the tweak IPC handler without touching othe
                         publishedReads++;
                         return { ...await store.getStats(threadId), source: "snapshot", snapshotRevision: 7 };
                     },
+                    release() {},
                     dispose: () => { publisherDisposed++; },
                 };
             },
@@ -70,6 +71,7 @@ test("disable and hot reload release the tweak IPC handler without touching othe
                             { timeoutMs: 5000, maxChars: 65536 });
                         return { ...identity, status: "ok", tps: result.tps, source: "snapshot" };
                     },
+                    release() {},
                     dispose: () => { snapshotsDisposed++; },
                 };
             },
@@ -109,7 +111,7 @@ test("disable and hot reload release the tweak IPC handler without touching othe
     const bind = handlers.get("codexpp:com.kpk.session-stats:bindings");
     const getStats = handlers.get("codexpp:com.kpk.session-stats:stats");
     const event = { senderFrame: frame, sender: { mainFrame: frame } };
-    const identity = { threadId: "019f7463-6700-7000-8000-000000000001", hostId: "local" };
+    const identity = { threadId: "019f7463-6700-7000-8000-000000000001", hostId: "local", ownerId: "view" };
     const localStats = await getStats(event, identity);
     assert.equal(localStats.status, "not-found");
     assert.equal(localStats.hostId, "local");
@@ -137,6 +139,7 @@ test("disable and hot reload release the tweak IPC handler without touching othe
     assert.equal(disposed, 1);
     await new Promise(setImmediate);
     tweak.stop(); tweak.stop();
+    await new Promise(setImmediate);
     assert.equal(disposed, 2);
     assert.equal(transportDisposed, 2);
     assert.equal(publisherStarted, 2);
@@ -159,12 +162,13 @@ test("a reloaded module cannot publish until the preceding publisher has drained
         if (name === "./src/session-store.cjs") return { createSessionStore: () => ({ dispose() {} }) };
         if (name === "./src/remote-session-store.cjs") return { createRemoteSessionStore: () => ({ dispose() {} }) };
         if (name === "./src/snapshot-remote-store.cjs") return {
-            createSnapshotRemoteStore: () => ({ dispose() {} }),
+            createSnapshotRemoteStore: () => ({ release() {}, dispose() {} }),
         };
         if (name === "./src/remote-transport.cjs") return { createRemoteTransport: () => ({ dispose() {} }) };
         if (name === "./src/snapshot-publisher.cjs") return { createSnapshotPublisher: () => {
             const number = publishers.length;
             const state = { starts: 0, reads: 0, start() { this.starts++; },
+                release() {},
                 async getStats(threadId) { this.reads++; return { status: "ok", threadId, snapshotRevision: number + 1 }; },
                 dispose: () => number === 0 ? oldDispose : Promise.resolve() };
             publishers.push(state); return state;
@@ -180,7 +184,7 @@ test("a reloaded module cannot publish until the preceding publisher has drained
     assert.equal(publishers[0].starts, 1);
     first.stop();
     const second = createModule(); second.start(api);
-    const frame = {}, identity = { threadId: "019f7463-6700-7000-8000-000000000001", hostId: "local" };
+    const frame = {}, identity = { threadId: "019f7463-6700-7000-8000-000000000001", hostId: "local", ownerId: "view" };
     const pending = handlers.get("codexpp:com.kpk.session-stats:stats")({ senderFrame: frame, sender: { mainFrame: frame } }, identity);
     await new Promise(setImmediate);
     assert.equal(publishers[1].starts, 0);
@@ -191,4 +195,67 @@ test("a reloaded module cannot publish until the preceding publisher has drained
     assert.equal(publishers[1].starts, 1);
     assert.equal(publishers[1].reads, 1);
     second.stop();
+});
+
+test("remote cleanup cannot delay a reloaded local publisher and retains its transport until drained", async t => {
+    const source = fs.readFileSync(path.join(__dirname, "../index.js"), "utf8");
+    let finishRelease, finishDispose;
+    const release = new Promise(resolve => { finishRelease = resolve; });
+    const dispose = new Promise(resolve => { finishDispose = resolve; });
+    t.after(() => { finishRelease(); finishDispose(); });
+    const handlers = new Map(), publishers = [], transports = [];
+    let stores = 0, releaseCalls = 0;
+    const requireFixture = name => {
+        if (name === "electron") return { ipcMain: {
+            handle: (key, fn) => handlers.set(key, fn), removeHandler: key => handlers.delete(key),
+        } };
+        if (name === "./src/binding.cjs") return { bindingScript: "bindings" };
+        if (name === "./src/session-store.cjs") return { createSessionStore: () => ({ dispose() {} }) };
+        if (name === "./src/snapshot-remote-store.cjs") return { createSnapshotRemoteStore: () => {
+            const number = stores++;
+            return {
+                async getStats(identity) { return { ...identity, status: "not-found" }; },
+                release() { releaseCalls++; return number === 0 ? release : Promise.resolve(); },
+                dispose: () => number === 0 ? dispose : Promise.resolve(),
+            };
+        } };
+        if (name === "./src/remote-transport.cjs") return { createRemoteTransport: () => {
+            const state = { disposals: 0, dispose() { this.disposals++; } };
+            transports.push(state); return state;
+        } };
+        if (name === "./src/snapshot-publisher.cjs") return { createSnapshotPublisher: () => {
+            const state = { starts: 0, reads: 0, start() { this.starts++; }, release() {},
+                async getStats(threadId) { this.reads++; return { status: "ok", threadId }; },
+                dispose: () => Promise.resolve() };
+            publishers.push(state); return state;
+        } };
+        return require(name);
+    };
+    const context = vm.createContext({ require: requireFixture, process, __dirname: path.join(__dirname, "..") });
+    const createModule = () => vm.runInContext(`(function() { const module = { exports: {} }; ${source}\nreturn module.exports; })()`, context);
+    const api = { process: "main", manifest: { id: "com.kpk.session-stats" }, log: { info() {} } };
+    const first = createModule(); first.start(api);
+    const frame = {}, event = { senderFrame: frame, sender: { mainFrame: frame } };
+    const identity = { threadId: "019f7463-6700-7000-8000-000000000001", ownerId: "view", hostId: "remote-control:slow" };
+    await handlers.get("codexpp:com.kpk.session-stats:stats")(event, identity);
+    first.stop();
+    const second = createModule(); second.start(api);
+    t.after(() => second.stop());
+    let localResult;
+    const local = handlers.get("codexpp:com.kpk.session-stats:stats")(event, { ...identity, hostId: "local" })
+        .then(value => { localResult = value; });
+    await new Promise(setImmediate);
+    assert.equal(publishers[1].starts, 1, "only an old publisher write may delay local startup");
+    assert.equal(publishers[1].reads, 1);
+    assert.equal(localResult?.status, "ok");
+    assert.equal(releaseCalls, 1);
+    assert.equal(transports[0].disposals, 0);
+    finishRelease();
+    await new Promise(setImmediate);
+    assert.equal(transports[0].disposals, 0, "remote store disposal must also drain before transport disposal");
+    finishDispose();
+    await new Promise(setImmediate);
+    assert.equal(transports[0].disposals, 1);
+    assert.equal(transports[1].disposals, 0);
+    await local;
 });

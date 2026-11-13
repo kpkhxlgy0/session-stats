@@ -85,7 +85,7 @@ test('a remote demand marker publishes an older real session outside the eight r
     assert.equal(published.stats.status, 'ok');
 });
 
-test('the demand pump runs while a recent background source remains blocked', async t =>
+test('the demand pump runs while another explicitly visible source remains blocked', async t =>
 {
     const blocked = deferred(), entered = deferred();
     const f = await fixture(t, { pollMs: 5, discover: async () => [id(1)], store: { async getStats(threadId)
@@ -93,33 +93,33 @@ test('the demand pump runs while a recent background source remains blocked', as
         if (threadId === id(1)) { entered.resolve(); await blocked.promise; }
         return { ...Stats };
     } } });
-    const starting = f.publisher.start();
+    const local = f.publisher.getStats(id(1), { ownerId: 'blocked-view' });
     await entered.promise;
+    const starting = f.publisher.start();
     await eventually(() => exists(f.requests));
     await f.write(id(99));
     try { await eventually(() => exists(f.snapshot(id(99)))); }
-    finally { blocked.resolve(); await starting; }
+    finally { blocked.resolve(); await Promise.all([starting, local]); }
     assert.equal(JSON.parse(await fs.readFile(f.snapshot(id(99)), 'utf8')).threadId, id(99));
 });
 
-test('the demand pump runs while recent filesystem discovery remains blocked', async t =>
+test('the demand pump never enters an injected recent filesystem discovery', async t =>
 {
-    const blocked = deferred(), entered = deferred();
-    const f = await fixture(t, { pollMs: 5, discover: async () => { entered.resolve(); return blocked.promise; } });
-    const starting = f.publisher.start();
-    await entered.promise;
+    let discoveries = 0;
+    const f = await fixture(t, { pollMs: 5, discover: () => { discoveries++; return new Promise(() => {}); } });
+    await f.publisher.start();
     await eventually(() => exists(f.requests));
     await f.write(id(99));
-    try { await eventually(() => exists(f.snapshot(id(99)))); }
-    finally { blocked.resolve([]); await starting; }
+    await eventually(() => exists(f.snapshot(id(99))));
+    assert.equal(discoveries, 0);
 });
 
 test('only fresh matching request records initiate publication and unknown files survive cleanup', async t =>
 {
     const f = await fixture(t);
     await fs.mkdir(f.requests, { recursive: true });
-    await f.write(id(1), 70000);
-    await f.write(id(2), 69999);
+    await f.write(id(1), 92000);
+    await f.write(id(2), 91999);
     await f.write(id(3), 105001);
     await fs.writeFile(f.request(id(4)), marker(id(5), 100000));
     await fs.writeFile(f.request(id(6)), 'unknown');
@@ -143,16 +143,16 @@ test('renewed marker leases keep demand active and expired demand-only interest 
     await f.publisher.refresh();
     await eventually(() => exists(f.snapshot(id(1))));
     await f.publisher.refresh();
-    f.setTime(125000);
-    await f.write(id(1), 125000, id(900));
+    f.setTime(105000);
+    await f.write(id(1), 105000, id(900));
     await f.publisher.refresh();
     await f.publisher.refresh();
-    f.setTime(140001);
+    f.setTime(108001);
     f.calls.length = 0;
     await f.publisher.refresh();
     await eventually(() => f.calls.length > 0);
     assert.equal(f.calls.includes(id(1)), true);
-    f.setTime(155001);
+    f.setTime(113001);
     f.calls.length = 0;
     await f.publisher.refresh();
     assert.deepEqual(f.calls, []);
@@ -164,7 +164,7 @@ test('renewed marker leases keep demand active and expired demand-only interest 
 test('expired marker cleanup retains explicit interest and skips symlink requests', async t =>
 {
     const f = await fixture(t);
-    await f.publisher.getStats(id(1));
+    await f.publisher.getStats(id(1), { ownerId: 'visible-view' });
     await fs.mkdir(f.requests);
     await f.write(id(1), 69999);
     const outside = path.join(f.root, 'outside.json');
@@ -270,17 +270,17 @@ test('multiple fresh nonce markers use the latest request time regardless of enu
     const f = await fixture(t);
     await fs.mkdir(f.requests, { recursive: true });
     await f.write(id(1), 100000, id(900));
-    await f.write(id(1), 80000, id(901));
+    await f.write(id(1), 95000, id(901));
     await f.publisher.refresh();
     await eventually(() => exists(f.snapshot(id(1))));
     await f.publisher.refresh();
-    f.setTime(115001);
+    f.setTime(104001);
     f.calls.length = 0;
     await f.publisher.refresh();
     await eventually(() => f.calls.length > 0);
     assert.equal(await exists(f.request(id(1), id(900))), true);
     assert.equal(await exists(f.request(id(1), id(901))), false);
-    f.setTime(130001);
+    f.setTime(108001);
     f.calls.length = 0;
     await f.publisher.refresh();
     assert.deepEqual(f.calls, []);

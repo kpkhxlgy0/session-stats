@@ -1,12 +1,13 @@
 'use strict';
 
 const { createSnapshotProtocol } = require('./snapshot.cjs');
+const { randomUUID } = require('node:crypto');
 
 const MaxSessions = 32;
 const MaxRetiredPublishers = 32;
 const RequestBudget = Object.freeze({ timeoutMs: 5000, maxChars: 64 * 1024 });
 const MaxResponseWaitMs = 750;
-const DemandIntervalMs = 10000;
+const DemandIntervalMs = 2000;
 
 function validHostId(value)
 {
@@ -31,6 +32,8 @@ function createSnapshotRemoteStore({ now = Date.now, pollMs,
     responseWaitMs = Math.min(responseWaitMs, MaxResponseWaitMs);
     const emptyStats = protocol.projectStats({ status: 'unavailable' });
     const sessions = new Map();
+    const owners = new Map();
+    const releases = new Set();
     let disposed = false;
 
     const current = entry => !disposed && sessions.get(entry.key) === entry;
@@ -40,6 +43,31 @@ function createSnapshotRemoteStore({ now = Date.now, pollMs,
     function cancelEntry(entry)
     {
         for (const cancel of [...entry.cancellations]) cancel();
+    }
+
+    function retire(entry)
+    {
+        if (sessions.get(entry.key) === entry) sessions.delete(entry.key);
+        for (const ownerId of entry.owners) owners.delete(ownerId);
+        entry.owners.clear();
+        cancelEntry(entry);
+        if (!entry.rolloutPath || entry.released) return Promise.resolve();
+        entry.released = true;
+        // This narrow internal operation is queued behind any in-flight lease write by the transport.
+        const task = Promise.resolve().then(() => entry.request('snapshot/release', {
+            rolloutPath: entry.rolloutPath, threadId: entry.threadId, consumerId: entry.consumerId,
+        }, RequestBudget)).catch(() => {}).finally(() => releases.delete(task));
+        releases.add(task);
+        return task;
+    }
+
+    function release(ownerId)
+    {
+        const entry = owners.get(ownerId);
+        if (!entry) return Promise.resolve();
+        owners.delete(ownerId);
+        entry.owners.delete(ownerId);
+        return entry.owners.size ? Promise.resolve() : retire(entry);
     }
 
     function block(entry, reason)
@@ -105,10 +133,13 @@ function createSnapshotRemoteStore({ now = Date.now, pollMs,
 
     function requestDemand(entry, request, rolloutPath)
     {
-        if (!current(entry) || now() < entry.nextDemandAt) return;
+        if (!current(entry) || entry.demandTask || now() < entry.nextDemandAt) return;
         entry.nextDemandAt = now() + DemandIntervalMs;
+        entry.rolloutPath = rolloutPath;
+        entry.request = request;
         // The caller handles this internal signal; it is never forwarded as a native RPC endpoint.
-        call(entry, request, 'snapshot/request', { rolloutPath, threadId: entry.threadId }).catch(() => {});
+        entry.demandTask = call(entry, request, 'snapshot/request', { rolloutPath, threadId: entry.threadId,
+            consumerId: entry.consumerId }).catch(() => {}).finally(() => { entry.demandTask = null; });
     }
 
     function decode(value)
@@ -213,16 +244,24 @@ function createSnapshotRemoteStore({ now = Date.now, pollMs,
             {
                 const oldest = sessions.keys().next().value;
                 const removed = sessions.get(oldest);
-                sessions.delete(oldest);
-                cancelEntry(removed);
+                void retire(removed);
             }
             entry = { key, hostId, threadId, accepted: null, retired: new Set(), blocked: false,
+                owners: new Set(), consumerId: randomUUID(), request, rolloutPath: null, released: false,
                 probeTask: null, nextProbeAt: -Infinity, nextDemandAt: -Infinity,
                 reason: 'snapshot-loading', cancellations: new Set() };
         }
         sessions.delete(key);
         sessions.set(key, entry);
+        if (identity.ownerId !== undefined)
+        {
+            if (owners.get(identity.ownerId) !== entry) void release(identity.ownerId);
+            owners.set(identity.ownerId, entry);
+            entry.owners.add(identity.ownerId);
+        }
         peek(entry);
+        // Visible callers must keep a verified target leased even while its snapshot probe is slow.
+        if (!entry.blocked && entry.rolloutPath) requestDemand(entry, request, entry.rolloutPath);
         if (!entry.probeTask && now() >= entry.nextProbeAt)
         {
             entry.nextProbeAt = now() + pollMs;
@@ -250,13 +289,15 @@ function createSnapshotRemoteStore({ now = Date.now, pollMs,
 
     function dispose()
     {
-        if (disposed) return;
+        if (disposed) return Promise.allSettled([...releases]);
         disposed = true;
-        for (const entry of sessions.values()) cancelEntry(entry);
+        for (const entry of [...sessions.values()]) void retire(entry);
         sessions.clear();
+        owners.clear();
+        return Promise.allSettled([...releases]);
     }
 
-    return { getStats, dispose };
+    return { getStats, release, dispose };
 }
 
 module.exports = { createSnapshotRemoteStore };

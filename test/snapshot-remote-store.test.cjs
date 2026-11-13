@@ -41,9 +41,12 @@ function fixture(t, options = {})
         state.calls.push({ method, params, budget });
         if (state.hook) await state.hook(method, params, budget);
         if (method === 'thread/read') return state.response ?? { thread: { id: ThreadId, path: Rollout } };
+        if (method === 'snapshot/release') return {};
         if (method === 'snapshot/request')
         {
-            assert.deepEqual(params, { rolloutPath: state.response?.thread.path ?? Rollout, threadId: ThreadId });
+            assert.deepEqual(params, { rolloutPath: state.response?.thread.path ?? Rollout,
+                threadId: ThreadId, consumerId: params.consumerId });
+            assert.match(params.consumerId, /^[0-9a-f-]{36}$/);
             return {};
         }
         assert.ok([Home, Directory, File].includes(params.path), `Unexpected snapshot RPC path: ${params.path}`);
@@ -104,7 +107,7 @@ for (const home of ['D:\\Users\\runner\\.codex', '\\\\?\\D:\\Users\\runner\\.cod
             if (method === 'thread/read') return { thread: { id: ThreadId.toUpperCase(), path: rollout } };
             if (method === 'snapshot/request')
             {
-                assert.deepEqual(params, { rolloutPath: rollout, threadId: ThreadId });
+                assert.deepEqual(params, { rolloutPath: rollout, threadId: ThreadId, consumerId: params.consumerId });
                 return {};
             }
             assert.ok([home, directory, file].includes(params.path));
@@ -326,24 +329,24 @@ test('an older missing snapshot requests one bounded runner sample and accepts a
     assert.equal((await source.stats()).unavailableReason, 'snapshot-missing');
     const demands = source.calls.filter(call => call.method === 'snapshot/request');
     assert.equal(demands.length, 1);
-    assert.deepEqual(demands[0].params, { rolloutPath, threadId: ThreadId });
+    assert.deepEqual(demands[0].params, { rolloutPath, threadId: ThreadId, consumerId: demands[0].params.consumerId });
     assert.equal(demands[0].budget.timeoutMs, 5000);
     assert.equal(demands[0].budget.maxChars, 65536);
     assert.ok(demands[0].budget.signal instanceof AbortSignal);
     source.missing = false;
     source.sample = sample({ generatedAt: 102000 });
     assert.equal((await source.refresh()).source, 'snapshot');
-    assert.equal(source.calls.filter(call => call.method === 'snapshot/request').length, 1);
+    assert.equal(source.calls.filter(call => call.method === 'snapshot/request').length, 2);
 });
 
-test('fresh snapshot polling renews runner demand no more than once per ten seconds', async t =>
+test('fresh snapshot polling renews runner demand at most once per two seconds', async t =>
 {
     const source = fixture(t);
     await source.stats();
     for (let index = 0; index < 4; index++) await source.refresh();
-    assert.equal(source.calls.filter(call => call.method === 'snapshot/request').length, 1);
+    assert.equal(source.calls.filter(call => call.method === 'snapshot/request').length, 5);
     assert.equal((await source.refresh()).source, 'snapshot');
-    assert.equal(source.calls.filter(call => call.method === 'snapshot/request').length, 2);
+    assert.equal(source.calls.filter(call => call.method === 'snapshot/request').length, 6);
     assert.equal(source.calls.filter(call => call.method === 'fs/readFile').length, 6);
 });
 
@@ -353,7 +356,7 @@ test('failed demand leases do not invalidate fresh metrics or create a rapid ret
     source.hook = method => { if (method === 'snapshot/request') throw new Error('Request directory unavailable'); };
     assert.equal((await source.stats()).status, 'ok');
     for (let index = 0; index < 4; index++) assert.equal((await source.refresh()).source, 'snapshot');
-    assert.equal(source.calls.filter(call => call.method === 'snapshot/request').length, 1);
+    assert.equal(source.calls.filter(call => call.method === 'snapshot/request').length, 5);
 });
 
 test('an in-flight demand never delays snapshot reads and disposal cancels its wrapper', async t =>
@@ -377,7 +380,8 @@ test('an in-flight demand never delays snapshot reads and disposal cancels its w
     const count = source.calls.length;
     gate.resolve();
     await flush();
-    assert.equal(source.calls.length, count);
+    assert.equal(source.calls.length, count + 1);
+    assert.equal(source.calls.at(-1).method, 'snapshot/release');
     assert.equal((await source.stats()).status, 'unavailable');
 });
 
@@ -433,7 +437,7 @@ test('runner demand leases are isolated when the lookup switches remote hosts', 
     source.clock += 2000;
     await source.store.getStats({ hostId: HostId, threadId: ThreadId }, request(HostId));
     await flush();
-    assert.deepEqual(demands, [HostId, otherHost]);
+    assert.deepEqual(demands, [HostId, otherHost, HostId]);
 });
 
 test('a transient read failure keeps an accepted sample only until its TTL', async t =>

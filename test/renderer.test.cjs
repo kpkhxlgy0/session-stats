@@ -155,7 +155,10 @@ test("statistics requests include the remote host", async (t) => {
     const controller = startRenderer(f.api, { window: f.dom.window, pollMs: 60000 });
     t.after(() => controller.stop());
     await settle(f.dom);
-    assert.deepEqual(f.requests, [{ threadId: firstId, hostId: "remote-control:example" }]);
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.requests[0].threadId, firstId);
+    assert.equal(f.requests[0].hostId, "remote-control:example");
+    assert.equal(typeof f.requests[0].ownerId, "string");
     assert.match(f.root.querySelector("[data-session-stats]")?.textContent ?? "", /209 tok\/s/);
 });
 

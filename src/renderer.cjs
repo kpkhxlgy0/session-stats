@@ -141,19 +141,24 @@ function startRenderer(api, options = {}) {
     }
 
     function unmount(root, entry) {
+        entry.inflight = null;
+        Promise.resolve(api.ipc.invoke("release", { ownerId: entry.ownerId })).catch(() => {});
         entry.anchor.remove();
         delete root.dataset.sessionStatsPanel;
         entries.delete(root);
     }
 
     async function refresh(root, entry) {
-        if (stopped || entry.inflight || !root.isConnected) return;
+        if (stopped || doc.visibilityState === "hidden" || entry.inflight || !isVisible(root, win)) return;
+        const time = Date.now();
+        if (time >= entry.requestedAt && time - entry.requestedAt < (options.pollMs ?? 1000)) return;
+        entry.requestedAt = time;
         const request = {};
         const threadId = entry.threadId;
         const hostId = entry.hostId;
         entry.inflight = request;
         try {
-            const stats = await api.ipc.invoke("stats", { threadId, hostId });
+            const stats = await api.ipc.invoke("stats", { threadId, hostId, ownerId: entry.ownerId });
             if (stopped || entries.get(root) !== entry || entry.inflight !== request) return;
             if (stats?.threadId !== threadId || stats?.hostId !== hostId) return;
             render(entry, stats);
@@ -175,6 +180,8 @@ function startRenderer(api, options = {}) {
         if (stopped) return;
         if (bindingRequest) { dirty = true; return; }
         dirty = false;
+        prune();
+        if (doc.visibilityState === "hidden") return;
         const roots = new Set(doc.querySelectorAll(TARGETS));
         const visibleRoots = [...roots].filter((root) => isVisible(root, win));
         const bindings = new Map();
@@ -212,16 +219,31 @@ function startRenderer(api, options = {}) {
             }
             if (!entry || entry.threadId !== bound.threadId || entry.hostId !== bound.hostId) {
                 if (entry) unmount(root, entry);
-                entry = { ...makeBar(doc), ...bound, inflight: null, logged: false };
+                entry = { ...makeBar(doc), ...bound, ownerId: `${keyPrefix}-${++nextKey}`,
+                    requestedAt: -Infinity, inflight: null, logged: false };
                 entries.set(root, entry);
                 render(entry, null);
                 mount(root, entry);
                 void refresh(root, entry);
-            } else mount(root, entry);
+            } else { mount(root, entry); void refresh(root, entry); }
         }
     }
 
+    function prune() {
+        for (const [root, entry] of entries) {
+            if (doc.visibilityState === "hidden" || !isVisible(root, win)) unmount(root, entry);
+        }
+    }
+
+    function routeChanged() {
+        for (const [root, entry] of entries) unmount(root, entry);
+        schedule();
+    }
+
+    function visibilityChanged() { prune(); schedule(); }
+
     function schedule() {
+        prune();
         if (bindingRequest) dirty = true;
         if (!stopped && scheduled === null) scheduled = win.setTimeout(reconcile, options.debounceMs ?? 100);
     }
@@ -231,34 +253,37 @@ function startRenderer(api, options = {}) {
     });
     observer.observe(doc.documentElement, { childList: true, subtree: true, attributes: true,
         attributeFilter: ["data-conversation-id", "data-composer-placement", "hidden", "inert", "aria-hidden", "style"] });
-    win.addEventListener("popstate", schedule);
-    win.addEventListener("hashchange", schedule);
+    win.addEventListener("popstate", routeChanged);
+    win.addEventListener("hashchange", routeChanged);
     win.addEventListener("resize", schedule);
-    doc.addEventListener("visibilitychange", schedule);
+    doc.addEventListener("visibilitychange", visibilityChanged);
+    const pagehide = () => controller.stop();
+    win.addEventListener("pagehide", pagehide);
     const timer = win.setInterval(() => {
         if (doc.visibilityState === "hidden") return;
         schedule();
-        for (const [root, entry] of entries) void refresh(root, entry);
     }, options.pollMs ?? 1000);
     reconcile();
     api.log.info("renderer started");
 
-    return {
+    const controller = {
         stop() {
             if (stopped) return;
             stopped = true;
             observer.disconnect();
             win.clearInterval(timer);
             if (scheduled !== null) win.clearTimeout(scheduled);
-            win.removeEventListener("popstate", schedule);
-            win.removeEventListener("hashchange", schedule);
+            win.removeEventListener("popstate", routeChanged);
+            win.removeEventListener("hashchange", routeChanged);
             win.removeEventListener("resize", schedule);
-            doc.removeEventListener("visibilitychange", schedule);
+            doc.removeEventListener("visibilitychange", visibilityChanged);
+            win.removeEventListener("pagehide", pagehide);
             for (const [root, entry] of entries) unmount(root, entry);
             for (const root of doc.querySelectorAll(TARGETS)) delete root.dataset.sessionStatsKey;
             entries.clear(); style.remove();
         },
     };
+    return controller;
 }
 
 module.exports = { resolveConversation, startRenderer };

@@ -5,6 +5,7 @@ function createSnapshotProtocol()
     const path = require('node:path');
     const maxBytes = 16384, maxRequestBytes = 1024, maxAgeMs = 30000, futureSkewMs = 5000;
     const pollMs = 2000, heartbeatMs = 10000;
+    const leaseMs = 8000;
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const session = /^rollout-(.+?)-([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl$/i;
     const counts = ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'modelActiveMs'];
@@ -158,6 +159,13 @@ function createSnapshotProtocol()
     {
         const id = normalizeThreadId(threadId);
         if (!id || !record(options) || !integer(options.now)) return null;
+        if (options.consumerId !== undefined)
+        {
+            const consumerId = normalizeThreadId(options.consumerId);
+            if (!consumerId || typeof options.active !== 'boolean' || !integer(options.sequence ?? 0)) return null;
+            return { schemaVersion: 2, producer: 'codex-session-stats-request', threadId: id,
+                requestedAt: options.now, consumerId, active: options.active, sequence: options.sequence ?? 0 };
+        }
         return { schemaVersion: 1, producer: 'codex-session-stats-request', threadId: id, requestedAt: options.now };
     }
 
@@ -169,13 +177,18 @@ function createSnapshotProtocol()
         let value;
         try { value = JSON.parse(text); }
         catch { return invalid('invalid'); }
-        if (!exactKeys(value, requestKeys) || value.schemaVersion !== 1
+        const modern = value?.schemaVersion === 2;
+        if (!exactKeys(value, modern ? [...requestKeys, 'consumerId', 'active', 'sequence'] : requestKeys)
+            || ![1, 2].includes(value.schemaVersion)
             || value.producer !== 'codex-session-stats-request') return invalid('invalid');
-        const request = makeRequest(value.threadId, { now: value.requestedAt });
+        const request = makeRequest(value.threadId, { now: value.requestedAt,
+            ...(modern ? { consumerId: value.consumerId, active: value.active, sequence: value.sequence } : {}) });
         if (!request || request.threadId !== value.threadId) return invalid('invalid');
         if (request.threadId !== normalizeThreadId(expected.threadId)) return invalid('identity');
+        if (modern && (request.consumerId !== value.consumerId || expected.consumerId !== undefined
+            && request.consumerId !== normalizeThreadId(expected.consumerId))) return invalid('identity');
         if (request.requestedAt - expected.now > futureSkewMs) return invalid('future');
-        if (expected.now - request.requestedAt > maxAgeMs) return invalid('expired');
+        if (expected.now - request.requestedAt > leaseMs) return invalid('expired');
         return { ok: true, request };
     }
 
@@ -190,7 +203,7 @@ function createSnapshotProtocol()
     }
 
     return { normalizeThreadId, snapshotPath, requestPath, remoteContext, projectStats, makeSnapshot, parseSnapshot,
-        makeRequest, parseRequest, toStats, maxBytes, maxRequestBytes, maxAgeMs, futureSkewMs, pollMs, heartbeatMs };
+        makeRequest, parseRequest, toStats, maxBytes, maxRequestBytes, maxAgeMs, leaseMs, futureSkewMs, pollMs, heartbeatMs };
 }
 
 module.exports = { createSnapshotProtocol };
